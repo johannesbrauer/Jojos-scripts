@@ -16,6 +16,9 @@ A small interactive Bash script that downloads a **video** and an **audio** trac
 
 [⬆ Back to top](#jojos-scripts)
 
+### Use Cases:
+Sites that restrict the directly access to the `m3u8` files and save audio and video tracks in different playlists. So you can't access them without browser emulation. With this script you can directly use the answer of the requested `m3u8` file from your browsers Network tab. Then it automatically merges video and audio so you get a single video file.
+
 ### What it does
 
 1. Asks you for the filenames of your local `video.m3u8` and (optionally) `audio.m3u8` playlists.
@@ -29,10 +32,10 @@ A small interactive Bash script that downloads a **video** and an **audio** trac
 
 You need these tools installed and available in your `PATH`:
 
-| Tool | Purpose | Install (Debian/Ubuntu) | Install (macOS) |
+| Tool | Purpose | Install (Debian/Fedora) | Install (macOS) |
 |---|---|---|---|
-| [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) | Downloads the media segments referenced in the `.m3u8` playlists | `sudo apt install yt-dlp` or `pip install -U yt-dlp` | `brew install yt-dlp` |
-| [`ffmpeg`](https://ffmpeg.org/) | Merges (muxes) the downloaded video/audio into the final file | `sudo apt install ffmpeg` | `brew install ffmpeg` |
+| [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) | Downloads the media segments referenced in the `.m3u8` playlists | `sudo apt install yt-dlp` or `sudo dnf install yt-dlp` | `brew install yt-dlp` |
+| [`ffmpeg`](https://ffmpeg.org/) | Merges (muxes) the downloaded video/audio into the final file | `sudo apt install ffmpeg`, should be pre-installes on Fedora | `brew install ffmpeg` |
 | `bash`, `sed` | Running the script itself | Preinstalled on virtually every Linux/macOS system | Preinstalled |
 
 Tested on Linux; should work on macOS and WSL as-is since it only relies on standard Bash/`sed`.
