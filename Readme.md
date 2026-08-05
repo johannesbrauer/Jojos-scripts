@@ -85,3 +85,7 @@ If you don't have (or don't want) a separate audio track, just enter `0` when as
 - **Relative vs. absolute segment paths:** The base-URL step only makes sense if your `.m3u8` file uses relative segment paths. If it already contains full URLs, just use yt-dlp.
 
 [⬆ Back to top](#jojos-scripts)
+
+### Ai-notice
+Yeah all these em-dashes come from a llm, guess I was just too lazy to write a documentation for my own scripts, and too lazy to remove them :) .
+
