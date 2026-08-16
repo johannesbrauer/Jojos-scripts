@@ -8,6 +8,7 @@
 
 # Stop immediately on errors
 set -e
+drain_stdin() { while read -r -t 0.1 -n 10000 _leftover; do :; done 2>/dev/null; }
 
 echo "=== Bash M3U8 Audio/Video Merger ==="
 echo ""
@@ -40,10 +41,12 @@ echo ""
 # 2. Ask for the base URLs
 read -r -p "Please enter the base URL for the VIDEO: " VIDEO_BASE
 VIDEO_BASE="${VIDEO_BASE//$'\r'/}"
+drain_stdin()
 
 if [ "$HAS_AUDIO" == true ]; then
     read -r -p "Please enter the base URL for the AUDIO: " AUDIO_BASE
     AUDIO_BASE="${AUDIO_BASE//$'\r'/}"
+    drain_stdin()
 fi
 
 echo ""
