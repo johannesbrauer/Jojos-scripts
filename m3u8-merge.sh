@@ -38,12 +38,12 @@ fi
 
 echo ""
 # 2. Ask for the base URLs
-read -p "Please enter the base URL for the VIDEO: " VIDEO_BASE
-[[ "$VIDEO_BASE" != */ ]] && VIDEO_BASE="$VIDEO_BASE/"
+read -r -p "Please enter the base URL for the VIDEO: " VIDEO_BASE
+VIDEO_BASE="${VIDEO_BASE//$'\r'/}"
 
 if [ "$HAS_AUDIO" == true ]; then
-    read -p "Please enter the base URL for the AUDIO: " AUDIO_BASE
-    [[ "$AUDIO_BASE" != */ ]] && AUDIO_BASE="$AUDIO_BASE/"
+    read -r -p "Please enter the base URL for the AUDIO: " AUDIO_BASE
+    AUDIO_BASE="${AUDIO_BASE//$'\r'/}"
 fi
 
 echo ""
