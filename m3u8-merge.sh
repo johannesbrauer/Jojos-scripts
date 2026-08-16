@@ -9,6 +9,33 @@
 # Stop immediately on errors
 set -e
 drain_stdin() { while read -r -t 0.1 -n 10000 _leftover; do :; done 2>/dev/null; }
+bind "set enable-bracketed-paste on" 2>/dev/null || true
+
+# Reads a base URL robustly: pastes often contain stray newlines or wrap the
+# URL over several lines, so every pasted line is joined and the result is
+# trimmed. Retries until a non-empty URL has been entered.
+read_base_url() {
+    local prompt="$1" url="" line
+    while :; do
+        url=""
+        read -e -r -p "$prompt" line
+        line="${line//$'\r'/}"
+        url+="$line"
+        while read -r -t 0.3 line && [ -n "$line" ]; do
+            line="${line//$'\r'/}"
+            url+="$line"
+        done
+        url="${url//$'\n'/}"
+        url="${url%\"}"; url="${url#\"}"
+        url="${url#"${url%%[![:space:]]*}"}"
+        url="${url%"${url##*[![:space:]]}"}"
+        if [ -n "$url" ]; then
+            printf '%s' "$url"
+            return 0
+        fi
+        echo "The URL is empty (a stray newline in the paste?) - please try again."
+    done
+}
 
 echo "=== Bash M3U8 Audio/Video Merger ==="
 echo ""
@@ -40,14 +67,20 @@ fi
 echo ""
 # 2. Ask for the base URLs
 drain_stdin
-read -r -p "Please enter the base URL for the VIDEO: " VIDEO_BASE
-VIDEO_BASE="${VIDEO_BASE//$'\r'/}"
+VIDEO_BASE="$(read_base_url "Please enter the base URL for the VIDEO: ")"
+echo "  -> using VIDEO base URL: $VIDEO_BASE"
+if [[ "$VIDEO_BASE" != *://* ]]; then
+    echo "Warning: this base URL has no scheme (https://...) - yt-dlp will likely fail."
+fi
 drain_stdin
 
 if [ "$HAS_AUDIO" == true ]; then
     drain_stdin
-    read -r -p "Please enter the base URL for the AUDIO: " AUDIO_BASE
-    AUDIO_BASE="${AUDIO_BASE//$'\r'/}"
+    AUDIO_BASE="$(read_base_url "Please enter the base URL for the AUDIO: ")"
+    echo "  -> using AUDIO base URL: $AUDIO_BASE"
+    if [[ "$AUDIO_BASE" != *://* ]]; then
+        echo "Warning: this base URL has no scheme (https://...) - yt-dlp will likely fail."
+    fi
     drain_stdin
 fi
 
@@ -58,10 +91,12 @@ OUTPUT_FILE="${OUTPUT_FILE:-final_video.mp4}"
 echo ""
 echo "[1/4] Processing manifests..."
 # 3. Create temporary .m3u8 files with absolute paths
-sed '/^#/!s|^|'"$VIDEO_BASE"'|' "$VIDEO_INPUT" > tmp_video_ready.m3u8
+#    (awk instead of sed: robust against '|' in the URL and skips blank lines,
+#     which otherwise would turn into the bare base URL and confuse yt-dlp)
+awk -v base="$VIDEO_BASE" '/^#/ { print; next } NF == 0 { next } { print base $0 }' "$VIDEO_INPUT" > tmp_video_ready.m3u8
 
 if [ "$HAS_AUDIO" == true ]; then
-    sed '/^#/!s|^|'"$AUDIO_BASE"'|' "$AUDIO_INPUT" > tmp_audio_ready.m3u8
+    awk -v base="$AUDIO_BASE" '/^#/ { print; next } NF == 0 { next } { print base $0 }' "$AUDIO_INPUT" > tmp_audio_ready.m3u8
 fi
 
 echo "[2/4] Downloading video track (disguised segments)..."
