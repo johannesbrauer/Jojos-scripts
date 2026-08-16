@@ -41,12 +41,12 @@ echo ""
 # 2. Ask for the base URLs
 read -r -p "Please enter the base URL for the VIDEO: " VIDEO_BASE
 VIDEO_BASE="${VIDEO_BASE//$'\r'/}"
-drain_stdin()
+drain_stdin
 
 if [ "$HAS_AUDIO" == true ]; then
     read -r -p "Please enter the base URL for the AUDIO: " AUDIO_BASE
     AUDIO_BASE="${AUDIO_BASE//$'\r'/}"
-    drain_stdin()
+    drain_stdin
 fi
 
 echo ""
