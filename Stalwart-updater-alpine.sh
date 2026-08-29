@@ -18,10 +18,10 @@
 #     attempted, one on success, one on failure (with rollback + log attached).
 #
 # Usage:
-#   stalwart-updater.sh                 run an update check/apply now
-#   stalwart-updater.sh --install-cron  register a daily 00:00 cron job
-#   stalwart-updater.sh --check-only    only report whether an update exists (no mail)
-#   stalwart-updater.sh --test-mail     send a test e-mail and exit
+#   stalwart-updater-alpine.sh                 run an update check/apply now
+#   stalwart-updater-alpine.sh --install-cron  register a daily 00:00 cron job
+#   stalwart-updater-alpine.sh --check-only    only report whether an update exists (no mail)
+#   stalwart-updater-alpine.sh --test-mail     send a test e-mail and exit
 # ==============================================================================
 
 set -eu
@@ -42,6 +42,7 @@ SMTP_USE_TLS="starttls"                              # starttls | ssl | none
 MAIL_RECIPIENTS="admin@example.com ops@example.com"  # space-separated, any count
 
 # --- Installation-specific paths (must match the installer) ---
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 BIN="/usr/local/bin/stalwart"
 BIN_BACKUP="/usr/local/bin/stalwart.prev"
 SERVICE="stalwart"
@@ -49,9 +50,9 @@ LOG_FILE="/var/log/stalwart/updater.log"
 LOCK_DIR="/run/stalwart-updater.lock"
 GITHUB_API="https://api.github.com/repos/stalwartlabs/stalwart/releases/latest"
 CRON_FILE="/etc/crontabs/root"
-CRON_LINE="0 0 * * * /usr/local/sbin/stalwart-updater.sh >> ${LOG_FILE} 2>&1"
+CRON_LINE="0 0 * * * ${SCRIPT_PATH} >> ${LOG_FILE} 2>&1"
 HEALTHCHECK_URL="http://127.0.0.1:8080/"
-STARTUP_WAIT_SECONDS=10
+STARTUP_WAIT_SECONDS=60
 
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
@@ -187,7 +188,7 @@ fi
 if [ "${1:-}" = "--install-cron" ]; then
     mkdir -p "$(dirname "$CRON_FILE")"
     touch "$CRON_FILE"
-    if grep -Fq "stalwart-updater.sh" "$CRON_FILE" 2>/dev/null; then
+    if grep -Fq "stalwart-updater-alpine.sh" "$CRON_FILE" 2>/dev/null; then
         echo "Cron entry already present in $CRON_FILE, leaving it as is."
     else
         echo "$CRON_LINE" >> "$CRON_FILE"
@@ -272,7 +273,7 @@ applied automatically by this script."
     exit 0
 fi
 
-send_mail "Stalwart: trying to auto-update ${CURRENT_VERSION} -> ${LATEST_VERSION}" \
+ "Stalwart: trying to auto-update ${CURRENT_VERSION} -> ${LATEST_VERSION}" \
 "Host: ${HOST_LABEL}
 
 Trying to auto update Stalwart ${CURRENT_VERSION} to Stalwart ${LATEST_VERSION}.

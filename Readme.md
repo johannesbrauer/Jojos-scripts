@@ -8,6 +8,7 @@ A personal collection of shell scripts and small tools. Click a script name belo
 |---|---|
 | [`m3u8-merge`](#m3u8-merge) | Downloads a video and audio track from `.m3u8` (HLS) playlists and merges them into a single `.mp4` file. |
 | [`Stalwart-installer-alpine`](#Stalwart-installer-alpine) | A simple isntaller script for Stalwart on alpine |
+| [`Stalwart-updater-alpine`](#Stalwart-updater-alpine) | Companion auto-updater for Stalwart on Alpine Linux |
 
 ---
 
@@ -98,3 +99,85 @@ Yeah all these em-dashes come from a llm, guess I was just too lazy to write a d
 ## Stalwart-installer-alpine
 
 A Simple installer script for the Stalwart mail server on alpine Linux, it installs the newest Stalwart version, creates additional directories, creates a stalwart group and user, creates the OpenRC service and starts Stalwart in bootstrap mode and that's it.
+
+---
+
+## Stalwart-updater-alpine
+
+A companion script to the Stalwart installer. It checks GitHub for a newer Stalwart release and safely swaps the binary with automatic rollback if the update fails. Features include e-mail notifications for errors, successes, and new major/minor versions, a `--check-only` mode, and an `--install-cron` option to set up daily update checks.
+
+[⬆ Back to top](#jojos-scripts)
+
+### What it does
+
+1. Queries the GitHub API for the latest Stalwart release and compares it to the currently installed version.
+2. If no newer version exists, exits quietly.
+3. If the update is a **major or minor** version bump (e.g. `0.7.x` -> `0.8.x`), it does **not** auto-update — instead it sends an e-mail asking you to review the changelog and upgrade manually, since these releases can contain breaking changes.
+4. If the update is a **patch-level** bump only (e.g. `0.8.1` -> `0.8.3`), it proceeds automatically:
+   - Sends a notification that an update is being attempted.
+   - Downloads the new binary from GitHub.
+   - Verifies the downloaded archive contains a valid `stalwart` binary.
+   - Backs up the current binary to `/usr/local/bin/stalwart.prev`.
+   - Stops the OpenRC service, installs the new binary, starts the service again.
+   - Runs a health check for up to 60 seconds, waiting for the service to respond on `http://127.0.0.1:8080/`.
+   - If the health check passes, sends a success e-mail.
+   - If the health check fails, **automatically rolls back** to the previous binary, restarts the service, and sends a failure e-mail with the full log attached.
+5. Every fatal error at any stage (GitHub API unreachable, download failed, binary missing, unsupported architecture, etc.) triggers a failure e-mail with the log attached — so the server never silently stops updating unnoticed.
+
+### E-mail transport
+
+The script sends all e-mails directly via `curl` using SMTP, so **no local MTA (postfix, sendmail, etc.) is required**. You configure an external SMTP relay (e.g. your provider's SMTP server or a self-hosted one) at the top of the script. It supports three TLS modes:
+
+| Mode | What it does |
+|---|---|
+| `starttls` (default) | Connects on port 587, upgrades to TLS via the STARTTLS command |
+| `ssl` | Connects on the given port with TLS from the start (typically port 465) |
+| `none` | No encryption — only use this on trusted networks |
+
+All recipients listed in `MAIL_RECIPIENTS` receive the same e-mail. Fatal errors and failed update attempts attach the full log file (`/var/log/stalwart/updater.log`) so you have context for debugging.
+
+### Requirements
+
+| Tool | Purpose |
+|---|---|
+| [`curl`](https://curl.se/) | Sends e-mails via SMTP and is used as a fallback for downloading |
+| [`wget`](https://www.gnu.org/software/wget/) | Primary tool for downloading release archives from GitHub |
+| [`jq`](https://stedolan.github.io/jq/) | Parses the JSON response from the GitHub API |
+| `coreutils` | Provides the `base64` command used for e-mail attachments |
+| `openrc` | Manages the Stalwart service (`rc-service`, `rc-update`) |
+| root access | The script must run as root to manage the service and write to system paths |
+
+These packages are installed automatically on Alpine if missing.
+
+### Installation
+
+1. Edit the SMTP configuration variables at the top of the script (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `MAIL_RECIPIENTS`).
+2. Place the script on your Alpine server (e.g. `/usr/local/bin/stalwart-updater-alpine.sh`).
+3. Make it secure and executable:
+
+```bash
+chmod 700 /usr/local/bin/stalwart-updater-alpine.sh
+```
+
+4. (Optional) Verify your SMTP settings work by sending a test e-mail:
+
+```bash
+stalwart-updater-alpine.sh --test-mail
+```
+
+### Usage
+
+| Command | What it does |
+|---|---|
+| `stalwart-updater-alpine.sh` | Run an update check/apply now (the default) |
+| `stalwart-updater-alpine.sh --check-only` | Only report whether an update is available (no e-mail sent, no changes made) |
+| `stalwart-updater-alpine.sh --install-cron` | Register a daily cron job at 00:00 that runs the updater automatically |
+| `stalwart-updater-alpine.sh --test-mail` | Send a test e-mail to verify your SMTP configuration |
+
+#### Setting up daily automatic updates
+
+```bash
+stalwart-updater-alpine.sh --install-cron
+```
+
+This adds a cron entry to `/etc/crontabs/root` and ensures `crond` is enabled and running. After that the updater runs every day at midnight automatically — patch updates are applied, major/minor updates trigger an e-mail instead.
