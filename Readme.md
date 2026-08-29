@@ -7,6 +7,7 @@ A personal collection of shell scripts and small tools. Click a script name belo
 | Script | Description |
 |---|---|
 | [`m3u8-merge`](#m3u8-merge) | Downloads a video and audio track from `.m3u8` (HLS) playlists and merges them into a single `.mp4` file. |
+| [`Stalwart-installer-alpine`](#Stalwart-installer-alpine) | A simple isntaller script for Stalwart on alpine |
 
 ---
 
@@ -92,3 +93,8 @@ If you don't have (or don't want) a separate audio track, just enter `0` when as
 ### Ai-notice
 Yeah all these em-dashes come from a llm, guess I was just too lazy to write a documentation for my own scripts, and too lazy to remove them :) .
 
+---
+
+## Stalwart-installer-alpine
+
+A Simple installer script for the Stalwart mail server on alpine Linux, it installs the newest Stalwart version, creates additional directories, creates a stalwart group and user, creates the OpenRC service and starts Stalwart in bootstrap mode and that's it.
