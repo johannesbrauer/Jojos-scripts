@@ -145,11 +145,11 @@ rc-update add pocketbase default >/dev/null
 info "Starting PocketBase service..."
 rc-service pocketbase start >/dev/null
 
-# PocketBase prints a one-time superuser setup link to its error log on first
+# PocketBase prints a one-time superuser setup link to its output log on first
 # start (same idea as Stalwart's bootstrap block) - wait up to ~15s for it.
 SETUP_LINE=""
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    SETUP_LINE="$(grep -i 'pbinstal' /var/log/pocketbase/error.log 2>/dev/null || true)"
+    SETUP_LINE="$(grep -i 'pbinstal' /var/log/pocketbase/output.log 2>/dev/null || true)"
     [ -n "$SETUP_LINE" ] && break
     sleep 1
 done
@@ -166,7 +166,7 @@ if [ -n "$SETUP_LINE" ]; then
     printf '%b\n' "${YELLOW}First-time superuser setup link (one-time, from log):${NC}"
     echo "$SETUP_LINE"
 else
-    echo "Could not extract the setup link. Inspect manually: tail -n 30 /var/log/pocketbase/error.log"
+    echo "Could not extract the setup link. Inspect manually: tail -n 30 /var/log/pocketbase/output.log"
 fi
 
 # --- 10. lbu persistence check ------------------------------------------------
