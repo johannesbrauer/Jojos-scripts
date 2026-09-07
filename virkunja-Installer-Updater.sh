@@ -11,8 +11,6 @@
 #   sudo ./virkunja-Installer-Updater.sh --update
 #        ./virkunja-Installer-Updater.sh --test-mail
 
-# ! There should be a automatic backup of the binary when updating is choosen, 
-# ! even if it's only meant to run only manually I think I will need more time restoring than for Implementing this functionality
 
 set -uo pipefail
 
@@ -28,6 +26,9 @@ BIN_LINK="/usr/bin/vikunja"
 LOG_FILE="/var/log/virkunja-installer-updater.log"
 
 GITHUB_API_URL="https://api.github.com/repos/go-vikunja/vikunja/releases/latest"
+
+# Public URL written into config.yml. Replace with your real server address.
+PUBLIC_URL="http://<your-server-ip>:3456/"
 
 # Mail settings used in config.yml and for --test-mail.l
 # Replace these example values with your real ones.
@@ -74,12 +75,27 @@ get_installed_version() {
     [[ -f "$VERSION_FILE" ]] && cat "$VERSION_FILE" || echo "none"
 }
 
+# Returns 0 (true) if version $1 is strictly greater than version $2
+version_gt() {
+    [[ "$1" == "$2" ]] && return 1
+    [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
+}
+
+# Finds the release asset URL for the given architecture via the GitHub API
+get_asset_url() {
+    local arch="$1"
+    curl -fsSL "$GITHUB_API_URL" \
+        | jq -r --arg arch "$arch" '.assets[] | select(.name | test("linux-" + $arch + "-full\\.zip$")) | .browser_download_url'
+}
+
 # Downloads and unpacks a release, prints the path it was extracted to
 download_release() {
-    local version="$1" arch="$2"
-    local file="vikunja-${version}-linux-${arch}-full.zip"
-    local url="https://dl.vikunja.io/vikunja/${version}/${file}"
+    local arch="$1"
     local dir; dir="$(mktemp -d)"
+
+    local url; url="$(get_asset_url "$arch")"
+    [[ -n "$url" ]] || { log ERROR "No release asset found for architecture $arch"; return 1; }
+    local file; file="$(basename "$url")"
 
     log INFO "Downloading $url"
     curl -fsSL -o "$dir/$file" "$url" || { log ERROR "Download failed: $url"; return 1; }
@@ -92,9 +108,7 @@ write_config() {
     log INFO "Writing $CONFIG_FILE"
     cat > "$CONFIG_FILE" <<EOF
 service:
-
-    # ! Review that before using, Ig that should be a variable at the top, to coonfigure it at one single place
-  publicurl: "http://<your-server-ip>:3456/"            
+  publicurl: "$PUBLIC_URL"            
   secret: "$(head -c32 /dev/urandom | base64)"
 
 mailer:
@@ -107,6 +121,7 @@ mailer:
 EOF
 }
 
+# writes the systemd service file for Vikunja
 write_service_file() {
     log INFO "Writing $SERVICE_FILE"
     cat > "$SERVICE_FILE" <<EOF
@@ -133,7 +148,7 @@ install_vikunja() {
     local version arch source
     version="$(get_latest_version)" || return 1
     arch="$(detect_arch)"
-    source="$(download_release "$version" "$arch")" || return 1
+    source="$(download_release "$arch")" || return 1
 
     mkdir -p "$INSTALL_DIR"
     cp -r "$source"/. "$INSTALL_DIR"/
@@ -150,32 +165,39 @@ install_vikunja() {
     log INFO "Installed Vikunja $version"
 }
 
+# Checking the Github api for a newer version, if there's one we're trying to auto update it
 update_vikunja() {
     [[ $EUID -eq 0 ]] || { log ERROR "Run with sudo"; exit 1; }
     [[ -x "$BIN_LINK" ]] || { log ERROR "Not installed, use --install first"; return 1; }
-
+ 
     local current latest source
     current="$(get_installed_version)"
     latest="$(get_latest_version)" || return 1
-
+ 
     if [[ "$current" == "$latest" ]]; then
         log INFO "Already up to date ($current)"
         return 0
     fi
-
+ 
+    if ! version_gt "$latest" "$current"; then
+        log ERROR "Installed version ($current) is not older than latest release ($latest), skipping update"
+        return 1
+    fi
+ 
     log INFO "Updating $current -> $latest"
-    source="$(download_release "$latest" "$(detect_arch)")" || return 1
-
+    source="$(download_release "$(detect_arch)")" || return 1
+ 
     systemctl stop vikunja
     cp -f "$INSTALL_DIR/vikunja" "$INSTALL_DIR/vikunja.bak.$current"
     cp -f "$source/vikunja" "$INSTALL_DIR/vikunja"
     chmod +x "$INSTALL_DIR/vikunja"
     echo "$latest" > "$VERSION_FILE"
-
+ 
     systemctl start vikunja || { log ERROR "Failed to start Vikunja after update"; return 1; }
     log INFO "Updated to $latest"
 }
 
+# We don't test the mailing functionality of virkunja here, we're just checking that the smtp credentials are correct and that we're able to send mails from this device.
 test_mail() {
     read -r -p "Send test mail to: " recipient
     [[ -n "$recipient" ]] || { log ERROR "No recipient given"; return 1; }
