@@ -46,6 +46,19 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2" | tee -a "$LOG_FILE" >&2
 }
 
+# Installs jq if it's missing, since get_asset_url relies on it
+check_jq() {
+    command -v jq >/dev/null 2>&1 && return 0
+
+    log INFO "jq not found, installing it"
+    if [[ $EUID -ne 0 ]]; then
+        log ERROR "jq is required. Install it with: sudo apt install jq"
+        exit 1
+    fi
+
+    apt-get update -y && apt-get install -y jq || { log ERROR "Failed to install jq"; exit 1; }
+}
+
 detect_arch() {
     case "$(uname -m)" in
         x86_64)    echo "amd64" ;;
@@ -85,8 +98,11 @@ version_gt() {
 get_asset_url() {
     local arch="$1"
     curl -fsSL "$GITHUB_API_URL" \
-        | jq -r --arg arch "$arch" '.assets[] | select(.name | test("linux-" + $arch + "-full\\.zip$")) | .browser_download_url'
+        | jq -r --arg arch "$arch" \
+            '.assets[] | select(.name | test("^vikunja-.*-linux-" + $arch + "-full\\.zip$")) | .browser_download_url' \
+        | head -n1
 }
+
 
 # Downloads and unpacks a release, prints the path it was extracted to
 download_release() {
@@ -100,8 +116,24 @@ download_release() {
     log INFO "Downloading $url"
     curl -fsSL -o "$dir/$file" "$url" || { log ERROR "Download failed: $url"; return 1; }
 
+  
     unzip -oq "$dir/$file" -d "$dir/extracted" || { log ERROR "Extraction failed: $file"; return 1; }
-    echo "$dir/extracted"
+
+    # Vikunja releases sometimes ship their contents inside a single subfolder instead of flat in the zip. If "extracted" only contains one folder, that's the actual content root.
+    local root="$dir/extracted"
+    local entries=("$root"/*)
+    if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
+        root="${entries[0]}"
+    fi
+
+    # The binary is usually named "vikunja-vX.Y.Z-linux-<arch>" instead of plain "vikunja". Find it by pattern and create a canonical "vikunja" copy so the rest of the script can keep referencing a fixed name.
+    local binary
+    binary="$(find "$root" -maxdepth 1 -type f -name "vikunja-v*-linux-${arch}*" | head -n1)"
+    [[ -n "$binary" ]] || { log ERROR "vikunja binary not found after extraction"; return 1; }
+    cp -f "$binary" "$root/vikunja"
+    chmod +x "$root/vikunja"
+
+    echo "$root"
 }
 
 write_config() {
@@ -188,6 +220,7 @@ update_vikunja() {
     source="$(download_release "$(detect_arch)")" || return 1
  
     systemctl stop vikunja
+    # Alr we're backing it uo here
     cp -f "$INSTALL_DIR/vikunja" "$INSTALL_DIR/vikunja.bak.$current"
     cp -f "$source/vikunja" "$INSTALL_DIR/vikunja"
     chmod +x "$INSTALL_DIR/vikunja"
@@ -221,6 +254,8 @@ test_mail() {
 # =============================================================================
 
 [[ $# -eq 0 ]] && { echo "Usage: $0 [--install] [--update] [--test-mail]"; exit 1; }
+
+check_jq
 
 for arg in "$@"; do
     case "$arg" in
