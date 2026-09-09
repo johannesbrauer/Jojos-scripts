@@ -21,7 +21,7 @@ KEEP_BACKUPS=5
 LOG_FILE="/var/log/jellyfin-updater.log"
 HEALTH_PORT="8096"
 HEALTH_URL_PATH="/System/Info/Public"
-HEALTH_RETRIES=10
+HEALTH_RETRIES=20
 HEALTH_DELAY=30
 MAIL_TO=""
 MAIL_FROM="jellyfin-updater@$(hostname -f 2>/dev/null || hostname)"
@@ -131,9 +131,22 @@ stop_jellyfin() {
 }
 
 start_jellyfin() {
-  if $RUNNING_VIA_SYSTEMD; then systemctl start "$SERVICE_NAME" 2>/dev/null || true
-  else sudo -u "$JELLYFIN_PROCESS_USER" nohup $JELLYFIN_PROCESS_CMD &>/dev/null &
-    sleep 2; JELLYFIN_PROCESS_PID=$!
+  if $RUNNING_VIA_SYSTEMD; then
+    systemctl start "$SERVICE_NAME" 2>/dev/null || true
+    sleep 3
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+      log "Systemd service '$SERVICE_NAME' started successfully"
+    else
+      log "WARNING: Systemd service '$SERVICE_NAME' may not be running. Check 'systemctl status $SERVICE_NAME'"
+    fi
+  else
+    sudo -u "$JELLYFIN_PROCESS_USER" nohup $JELLYFIN_PROCESS_CMD &>/dev/null &
+    sleep 3; JELLYFIN_PROCESS_PID=$!
+    if kill -0 "$JELLYFIN_PROCESS_PID" 2>/dev/null; then
+      log "User process started successfully, PID=$JELLYFIN_PROCESS_PID"
+    else
+      log "WARNING: User process may not be running. Check process manually."
+    fi
   fi
 }
 
@@ -277,7 +290,20 @@ deploy() {
 health_check() {
   local url="http://127.0.0.1:${HEALTH_PORT}${HEALTH_URL_PATH}" attempt
   for ((attempt=1; attempt<=HEALTH_RETRIES; attempt++)); do
-    curl -fsS "$url" 2>/dev/null | grep -q "\"Version\":\"$LATEST_VER\"" && return 0
+    log "Health check attempt $attempt/$HEALTH_RETRIES..."
+    if curl -fsS "$url" 2>/dev/null | grep -q "\"Version\":\"$LATEST_VER\""; then
+      log "Health check passed on attempt $attempt"
+      return 0
+    fi
+    if [ "$attempt" -eq 5 ] || [ "$attempt" -eq "$HEALTH_RETRIES" ]; then
+      log "Checking server logs for errors..."
+      if $RUNNING_VIA_SYSTEMD; then
+        journalctl -u "$SERVICE_NAME" --no-pager -n 20 2>/dev/null | tee -a "$LOG_FILE" || true
+      else
+        local log_dir; log_dir="$(dirname "$DATA_DIR")"
+        [ -f "$log_dir/logs/jellyfin_$(date +%Y-%m-%d).log" ] && tail -20 "$log_dir/logs/jellyfin_$(date +%Y-%m-%d).log" | tee -a "$LOG_FILE" || true
+      fi
+    fi
     sleep "$HEALTH_DELAY"
   done; return 1
 }
@@ -300,6 +326,7 @@ run_update() {
     ([ "$MIGRATE_TO_SYSTEMD" = true ] || ask_migrate_to_systemd) && create_systemd_service
   fi
   stop_jellyfin; deploy; start_jellyfin
+  log "Server started. Note: Jellyfin 12.x may take several minutes for database migrations on first startup."
   if health_check; then
     log "Updated successfully to ver $LATEST_VER"
     send_mail "Updated successfully to ver $LATEST_VER" "Updated from $CURRENT_VER to $LATEST_VER"
