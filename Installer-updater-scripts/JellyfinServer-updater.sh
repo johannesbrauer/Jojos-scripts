@@ -19,13 +19,14 @@
 #
 set -uo pipefail
 
-# ────────────────────────────── Configuration ──────────────────────────────
-SERVICE_NAME="jellyfin"                     # name of the systemd service
+# Service & paths
+SERVICE_NAME="jellyfin"                     # systemd service name
 DATA_DIR_OVERRIDE=""                        # empty = auto-detect from ExecStart
 BACKUP_DIR="/var/backups/jellyfin-updater"
 KEEP_BACKUPS=5
 LOG_FILE="/var/log/jellyfin-updater.log"
 
+# Health check
 HEALTH_PORT="8096"
 HEALTH_URL_PATH="/System/Info/Public"       # unauthenticated endpoint
 HEALTH_RETRIES=10
@@ -34,14 +35,18 @@ HEALTH_DELAY=3
 # Email (leave MAIL_TO empty to disable emails)
 MAIL_TO=""
 MAIL_FROM="jellyfin-updater@$(hostname -f 2>/dev/null || hostname)"
-SMTP_URL=""                                # e.g. smtp://mail.example.com:587 or smtps://mail.example.com:465
+SMTP_URL=""                                 # e.g. smtp://mail.example.com:587 or smtps://mail.example.com:465
 SMTP_USER=""
 SMTP_PASS=""
-# ────────────────────────────────────────────────────────────────────────────
+
 
 SCRIPT_PATH="$(readlink -f "$0")"
 TMP_DIR=""
 ROLLBACK_READY=false
+
+# ============================================================================
+# Helpers
+# ============================================================================
 
 log() {
   local line
@@ -53,12 +58,22 @@ log() {
 cleanup() { [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
+# Send email notification via curl (SMTP)
+# Args: $1 = subject, $2 = body
 send_mail() {
   local subject="$1" body="$2"
+
+  # Skip if email not configured
   [ -z "$MAIL_TO" ] && return 0
-  [ -z "$SMTP_URL" ] && { log "WARNING: MAIL_TO set but SMTP_URL not configured, skipping email"; return 0; }
+  [ -z "$SMTP_URL" ] && {
+    log "WARNING: MAIL_TO set but SMTP_URL not configured, skipping email"
+    return 0
+  }
+
   local boundary="jfupdater-$$" msg
   msg="$(mktemp)"
+
+  # Build MIME message with log attachment
   {
     echo "From: $MAIL_FROM"
     echo "To: $MAIL_TO"
@@ -82,15 +97,19 @@ send_mail() {
     fi
     echo "--$boundary--"
   } >"$msg"
+
+  # We're sending it easily via curl
   local opts=(-s --url "$SMTP_URL" --mail-from "$MAIL_FROM" --mail-rcpt "$MAIL_TO" --upload-file "$msg")
   [[ "$SMTP_URL" == smtp://* ]] && opts+=(--ssl-reqd)
   [ -n "$SMTP_USER" ] && opts+=(--user "$SMTP_USER:$SMTP_PASS")
+
   if ! curl "${opts[@]}" 2>/dev/null; then
     log "WARNING: failed to send email (curl exit code: $?)"
   fi
   rm -f "$msg"
 }
 
+# Error handler: logs, optionally rolls back, sends notification, exits
 die() {
   log "ERROR: $*"
   if $ROLLBACK_READY; then
@@ -108,7 +127,8 @@ notify_failure() {
 
 require_root() { [ "$(id -u)" -eq 0 ] || { echo "Please run as root." >&2; exit 1; }; }
 
-# ────────────────────────── Architecture & install ──────────────────────────
+# Architecture & Installation Detection
+# Map uname -m to Jellyfin architecture strings
 detect_arch() {
   case "$(uname -m)" in
     x86_64)        echo "amd64" ;;
@@ -118,17 +138,22 @@ detect_arch() {
   esac
 }
 
-# ExecStart line of the systemd service, with line continuations joined
+# Get ExecStart line from systemd unit, joining line continuations.
+# Tries multiple methods for robustness.
 unit_exec_line() {
   local exec_line
-  exec_line="$(systemctl show -p ExecStart --value "$SERVICE_NAME" 2>/dev/null | head -n1)"
-  [ -n "$exec_line" ] && echo "$exec_line" && return 0
 
+  # Method 1: systemctl show (fastest, most reliable)
+  exec_line="$(systemctl show -p ExecStart --value "$SERVICE_NAME" 2>/dev/null | head -n1)"
+  [ -n "$exec_line" ] && { echo "$exec_line"; return 0; }
+
+  # Method 2: systemctl cat with line-continuation joining
   exec_line="$(systemctl cat "$SERVICE_NAME" 2>/dev/null \
     | sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' \
     | sed -n 's/^ExecStart=//p' | head -n1)"
-  [ -n "$exec_line" ] && echo "$exec_line" && return 0
+  [ -n "$exec_line" ] && { echo "$exec_line"; return 0; }
 
+  # Method 3: read unit file directly via FragmentPath
   local unit_file
   unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME" 2>/dev/null)"
   [ -f "$unit_file" ] || return 1
@@ -137,27 +162,29 @@ unit_exec_line() {
   echo "$exec_line"
 }
 
-# Determines the binary, install directory and data directory. Supports
-# both an ExecStart pointing directly at the binary, and the official
-# wrapper-script pattern (jellyfin.sh with -d/-C/-c/-l flags, see
-# jellyfin.org/docs).
-# We need a hell of Regex here, If that breaks I'm fucked :)
+# Detect binary path, install directory, and data directory from systemd unit.
+# Handles both direct binary ExecStart and wrapper-script patterns.
+# The regex here is precise for Jellyfin's wrapper script format.
 find_installation() {
   local exec_line target invocation
+
   exec_line="$(unit_exec_line)"
   [ -z "$exec_line" ] && die "Could not determine ExecStart of service '$SERVICE_NAME'"
+
   target="$(awk '{print $1}' <<<"$exec_line")"
   [ -f "$target" ] || die "ExecStart target '$target' does not exist"
 
+  # If target is ELF binary, use ExecStart directly
   if file "$target" | grep -qi 'ELF'; then
     invocation="$exec_line"
   else
-    # Wrapper script: load simple VAR=value assignments, then resolve the
-    # line that actually invokes the jellyfin binary.
+    # Wrapper script: source simple VAR=value lines, then find the jellyfin invocation
     local vars joined raw
     vars="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=[^$`;&|]*$' "$target")"
     eval "$vars" 2>/dev/null
     joined="$(sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' "$target")"
+
+    # Match: jellyfin binary path (with optional leading whitespace, not part of another word)
     raw="$(grep -m1 -E '(^|[[:space:]])[^[:space:]]*/jellyfin([[:space:]]|$)' <<<"$joined")"
     [ -z "$raw" ] && die "Could not find the jellyfin binary in wrapper script '$target'"
     eval "invocation=\"$raw\"" 2>/dev/null
@@ -167,11 +194,14 @@ find_installation() {
   [ -x "$BIN_PATH" ] || die "Detected jellyfin binary '$BIN_PATH' is not executable"
   INSTALL_DIR="$(dirname "$BIN_PATH")"
 
-  DATA_DIR="$(sed -nE 's/.*(^|[[:space:]])-d ([^[:space:]]+).*/\2/p;s/.*--datadir[= ]([^[:space:]]+).*/\1/p' <<<"$invocation" | tail -n1)"
+  # Extract data directory from -d/--datadir flags in invocation
+  DATA_DIR="$(sed -nE \
+    's/.*(^|[[:space:]])-d ([^[:space:]]+).*/\2/p;
+     s/.*--datadir[= ]([^[:space:]]+).*/\1/p' <<<"$invocation" | tail -n1)"
   [ -n "$DATA_DIR_OVERRIDE" ] && DATA_DIR="$DATA_DIR_OVERRIDE"
   [ -z "$DATA_DIR" ] && DATA_DIR="/var/lib/jellyfin"
 
-  # Safety net: don't touch installations managed by a package manager
+  # Safety: reject package-manager installations
   if command -v dpkg >/dev/null 2>&1 && dpkg -S "$BIN_PATH" >/dev/null 2>&1; then
     die "'$BIN_PATH' is managed by dpkg – please update via apt instead"
   fi
@@ -182,7 +212,7 @@ find_installation() {
   log "Detected: binary=$BIN_PATH install_dir=$INSTALL_DIR data_dir=$DATA_DIR"
 }
 
-# ─────────────────────────── Versions & download ────────────────────────────
+# Version & Download
 current_version() {
   "$BIN_PATH" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
 }
@@ -195,9 +225,12 @@ latest_version() {
 download_package() {
   local version="$1" arch="$2" dest="$3"
   local dir="https://repo.jellyfin.org/files/server/linux/latest-stable/${arch}/"
+
+  # Try direct versioned URL first
   if curl -fsSL -o "$dest" "${dir}jellyfin_${version}-${arch}.tar.gz"; then
     return 0
   fi
+
   log "Direct download failed, trying directory listing as a fallback"
   local found
   found="$(curl -fsSL "$dir" | grep -oE "jellyfin_[0-9.]+-${arch}\.tar\.gz" | sort -V | tail -n1)"
@@ -205,14 +238,17 @@ download_package() {
   curl -fsSL -o "$dest" "${dir}${found}"
 }
 
-# ───────────────────────────── Backup / rollback ────────────────────────────
+# Backup & Rollback
 backup() {
   mkdir -p "$BACKUP_DIR"
   BACKUP_FILE="$BACKUP_DIR/jellyfin-backup-$(date '+%Y%m%d-%H%M%S').tar.gz"
   tar czf "$BACKUP_FILE" --absolute-names "$INSTALL_DIR" "$DATA_DIR" 2>>"$LOG_FILE" \
     || die "Backup failed"
   log "Backup created: $BACKUP_FILE"
-  ls -1t "$BACKUP_DIR"/jellyfin-backup-*.tar.gz 2>/dev/null | tail -n "+$((KEEP_BACKUPS + 1))" | xargs -r rm -f
+
+  # Prune old backups
+  ls -1t "$BACKUP_DIR"/jellyfin-backup-*.tar.gz 2>/dev/null \
+    | tail -n "+$((KEEP_BACKUPS + 1))" | xargs -r rm -f
 }
 
 rollback() {
@@ -227,12 +263,13 @@ Failed to update to ver ${LATEST_VER}, reason: $1
 Rolled back to ver ${CURRENT_VER}."
 }
 
-# ────────────────────────────── Deploy / health ─────────────────────────────
+# Deploy & Health Check
 deploy() {
   local pkg="$1" extract_dir="$TMP_DIR/extract"
   mkdir -p "$extract_dir"
   tar xzf "$pkg" -C "$extract_dir" || die "Could not extract package"
 
+  # Find the ELF jellyfin binary in extracted package
   local new_bin
   new_bin="$(find "$extract_dir" -type f -name jellyfin \
     -exec sh -c 'file "$1" | grep -qi ELF' _ {} \; -print | head -n1)"
@@ -245,6 +282,7 @@ deploy() {
   rsync -a --delete "$pkg_root"/ "$INSTALL_DIR"/ || die "Could not deploy new version"
   chown -R "$owner" "$INSTALL_DIR" 2>/dev/null || true
 
+  # If binary path changed, update systemd unit
   local new_bin_final="$INSTALL_DIR/$(basename "$new_bin")"
   if [ "$new_bin_final" != "$BIN_PATH" ]; then
     log "Binary path changed ($BIN_PATH -> $new_bin_final), updating systemd unit"
@@ -267,7 +305,7 @@ health_check() {
   return 1
 }
 
-# ───────────────────────────────── Main flow ────────────────────────────────
+# Main Flow
 run_update() {
   require_root
   TMP_DIR="$(mktemp -d)"
@@ -318,10 +356,7 @@ install_cron() {
   log "Cronjob installed: $cron_file ('$schedule')"
 }
 
-
-
-# Main Activity
-
+# Entry Point
 case "${1:-}" in
   --update|"")
     run_update
