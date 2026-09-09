@@ -121,7 +121,7 @@ die() {
 }
 
 notify_failure() {
-  local subject="$1" body="$2"
+  local subject="$1" body="${2:-}"
   send_mail "$subject" "$body"
 }
 
@@ -141,11 +141,11 @@ detect_arch() {
 # Get ExecStart line from systemd unit, joining line continuations.
 # Tries multiple methods for robustness.
 unit_exec_line() {
-  local exec_line
+  local exec_line unit_file
 
   # Method 1: systemctl show (fastest, most reliable)
   exec_line="$(systemctl show -p ExecStart --value "$SERVICE_NAME" 2>/dev/null | head -n1)"
-  [ -n "$exec_line" ] && { echo "$exec_line"; return 0; }
+  [ -n "$exec_line" ] && [ "$exec_line" != "ExecStart=" ] && { echo "$exec_line"; return 0; }
 
   # Method 2: systemctl cat with line-continuation joining
   exec_line="$(systemctl cat "$SERVICE_NAME" 2>/dev/null \
@@ -154,7 +154,6 @@ unit_exec_line() {
   [ -n "$exec_line" ] && { echo "$exec_line"; return 0; }
 
   # Method 3: read unit file directly via FragmentPath
-  local unit_file
   unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME" 2>/dev/null)"
   [ -f "$unit_file" ] || return 1
   exec_line="$(sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' "$unit_file" \
@@ -169,7 +168,13 @@ find_installation() {
   local exec_line target invocation
 
   exec_line="$(unit_exec_line)"
-  [ -z "$exec_line" ] && die "Could not determine ExecStart of service '$SERVICE_NAME'"
+  if [ -z "$exec_line" ]; then
+    # Debug: show what systemctl knows about the service
+    local status
+    status="$(systemctl status "$SERVICE_NAME" 2>&1 | head -20)"
+    log "DEBUG: systemctl status for '$SERVICE_NAME':\n$status"
+    die "Could not determine ExecStart of service '$SERVICE_NAME' (service may not exist or be named differently)"
+  fi
 
   target="$(awk '{print $1}' <<<"$exec_line")"
   [ -f "$target" ] || die "ExecStart target '$target' does not exist"
