@@ -56,6 +56,7 @@ trap cleanup EXIT
 send_mail() {
   local subject="$1" body="$2"
   [ -z "$MAIL_TO" ] && return 0
+  [ -z "$SMTP_URL" ] && { log "WARNING: MAIL_TO set but SMTP_URL not configured, skipping email"; return 0; }
   local boundary="jfupdater-$$" msg
   msg="$(mktemp)"
   {
@@ -84,7 +85,9 @@ send_mail() {
   local opts=(-s --url "$SMTP_URL" --mail-from "$MAIL_FROM" --mail-rcpt "$MAIL_TO" --upload-file "$msg")
   [[ "$SMTP_URL" == smtp://* ]] && opts+=(--ssl-reqd)
   [ -n "$SMTP_USER" ] && opts+=(--user "$SMTP_USER:$SMTP_PASS")
-  curl "${opts[@]}" || log "WARNING: failed to send email"
+  if ! curl "${opts[@]}" 2>/dev/null; then
+    log "WARNING: failed to send email (curl exit code: $?)"
+  fi
   rm -f "$msg"
 }
 
@@ -93,11 +96,14 @@ die() {
   if $ROLLBACK_READY; then
     rollback "$*"
   else
-    send_mail "Failed to update to ver ${LATEST_VER:-?}, reason: $*" \
-"Trying to update from ver ${CURRENT_VER:-?} to ver ${LATEST_VER:-?}
-Failed to update to ver ${LATEST_VER:-?}, reason: $*"
+    notify_failure "Failed to update to ver ${LATEST_VER:-?}, reason: $*"
   fi
   exit 1
+}
+
+notify_failure() {
+  local subject="$1" body="$2"
+  send_mail "$subject" "$body"
 }
 
 require_root() { [ "$(id -u)" -eq 0 ] || { echo "Please run as root." >&2; exit 1; }; }
@@ -114,9 +120,21 @@ detect_arch() {
 
 # ExecStart line of the systemd service, with line continuations joined
 unit_exec_line() {
-  systemctl cat "$SERVICE_NAME" 2>/dev/null \
+  local exec_line
+  exec_line="$(systemctl show -p ExecStart --value "$SERVICE_NAME" 2>/dev/null | head -n1)"
+  [ -n "$exec_line" ] && echo "$exec_line" && return 0
+
+  exec_line="$(systemctl cat "$SERVICE_NAME" 2>/dev/null \
     | sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' \
-    | sed -n 's/^ExecStart=//p' | head -n1
+    | sed -n 's/^ExecStart=//p' | head -n1)"
+  [ -n "$exec_line" ] && echo "$exec_line" && return 0
+
+  local unit_file
+  unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME" 2>/dev/null)"
+  [ -f "$unit_file" ] || return 1
+  exec_line="$(sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' "$unit_file" \
+    | sed -n 's/^ExecStart=//p' | head -n1)"
+  echo "$exec_line"
 }
 
 # Determines the binary, install directory and data directory. Supports
@@ -203,7 +221,7 @@ rollback() {
   rm -rf "$INSTALL_DIR" "$DATA_DIR"
   tar xzf "$BACKUP_FILE" -C / || log "ERROR: failed to restore backup"
   systemctl start "$SERVICE_NAME" 2>/dev/null
-  send_mail "Failed to update to ver ${LATEST_VER}, reason: $1" \
+  notify_failure "Failed to update to ver ${LATEST_VER}, reason: $1" \
 "Trying to update from ver ${CURRENT_VER} to ver ${LATEST_VER}
 Failed to update to ver ${LATEST_VER}, reason: $1
 Rolled back to ver ${CURRENT_VER}."
@@ -222,12 +240,11 @@ deploy() {
 
   local pkg_root owner
   pkg_root="$(dirname "$new_bin")"
-  owner="$(stat -c '%U:%G' "$INSTALL_DIR")"
+  owner="$(stat -c '%U:%G' "$INSTALL_DIR" 2>/dev/null || echo "root:root")"
 
   rsync -a --delete "$pkg_root"/ "$INSTALL_DIR"/ || die "Could not deploy new version"
-  chown -R "$owner" "$INSTALL_DIR"
+  chown -R "$owner" "$INSTALL_DIR" 2>/dev/null || true
 
-  # If the binary in the new package moved/was renamed: update the systemd unit
   local new_bin_final="$INSTALL_DIR/$(basename "$new_bin")"
   if [ "$new_bin_final" != "$BIN_PATH" ]; then
     log "Binary path changed ($BIN_PATH -> $new_bin_final), updating systemd unit"
@@ -286,6 +303,7 @@ run_update() {
     send_mail "Updated successfully to ver $LATEST_VER" \
 "Trying to update from ver $CURRENT_VER to ver $LATEST_VER
 Updated successfully to ver $LATEST_VER"
+    exit 0
   else
     die "Health check after update failed (service is not responding as expected)"
   fi
