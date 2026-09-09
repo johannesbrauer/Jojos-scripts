@@ -214,14 +214,27 @@ find_installation() {
 # Version, Download, Backup, Deploy, Health
 # ============================================================================
 
-current_version() { "$BIN_PATH" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1; }
-latest_version() { curl -fsSL https://api.github.com/repos/jellyfin/jellyfin/releases/latest | grep -m1 '"tag_name"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'; }
+current_version() { "$BIN_PATH" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.?[0-9]*' | head -n1; }
+latest_version() {
+  local auth_header=()
+  [ -n "${GITHUB_TOKEN:-}" ] && auth_header=(-H "Authorization: token $GITHUB_TOKEN")
+  local api_response
+  api_response="$(curl -fsSL "${auth_header[@]}" https://api.github.com/repos/jellyfin/jellyfin/releases/latest 2>/dev/null)" \
+    || return 1
+  if echo "$api_response" | grep -q "API rate limit exceeded"; then
+    log "ERROR: GitHub API rate limit exceeded. Set GITHUB_TOKEN env var for higher limits."
+    return 1
+  fi
+  echo "$api_response" | grep -m1 '"tag_name"' | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | sed 's/^v//'
+}
 
 download_package() {
   local dest="$TMP_DIR/jellyfin.tar.gz" dir="https://repo.jellyfin.org/files/server/linux/latest-stable/${ARCH}/"
   curl -fsSL -o "$dest" "${dir}jellyfin_${LATEST_VER}-${ARCH}.tar.gz" && return 0
   log "Direct download failed, trying directory listing as a fallback"
-  local found; found="$(curl -fsSL "$dir" | grep -oE "jellyfin_[0-9.]+-${ARCH}\.tar\.gz" | sort -V | tail -n1)"
+  local listing found
+  listing="$(curl -fsSL "$dir" 2>/dev/null)" || return 1
+  found="$(echo "$listing" | grep -oE "jellyfin_[0-9.]+-${ARCH}\.tar\.gz" | sort -V | tail -n1)"
   [ -z "$found" ] && return 1
   curl -fsSL -o "$dest" "${dir}${found}"
 }
