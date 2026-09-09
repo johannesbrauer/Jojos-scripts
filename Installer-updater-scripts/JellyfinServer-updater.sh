@@ -1,389 +1,319 @@
 #!/usr/bin/env bash
 #
-# jellyfin-updater.sh — Updater for the portable Jellyfin Linux build
-# (the "generic amd64/arm64/armhf tar.gz" release from repo.jellyfin.org).
-#
-# Auto-detects the install path, data directory and CPU architecture (via
-# the systemd service), creates a backup, updates to the latest stable
-# version (version number via the GitHub API), health-checks the new
-# service and automatically rolls back on failure.
-#
-# NOTE: this is meant for the manual "portable" tar.gz installation only.
-# Jellyfin instances installed via apt/dnf are detected and rejected —
-# use the respective package manager for those instead.
+# jellyfin-updater.sh — Updater for portable Jellyfin Linux builds
+# Auto-detects installation (systemd or user process), updates to latest
+# stable, health-checks, and rolls back on failure.
+# NOTE: manual "portable" tar.gz only — apt/dnf installs are rejected.
 #
 # Usage:
 #   sudo ./jellyfin-updater.sh                          # one-off update
+#   sudo ./jellyfin-updater.sh --update-migrate         # update & migrate to systemd
 #   sudo ./jellyfin-updater.sh --install-cron ["CRON"]  # set up a cronjob
 #   sudo ./jellyfin-updater.sh --help
 #
 set -uo pipefail
 
-# Service & paths
-SERVICE_NAME="jellyfin"                     # systemd service name
-DATA_DIR_OVERRIDE=""                        # empty = auto-detect from ExecStart
+# Config
+SERVICE_NAME="jellyfin"
+DATA_DIR_OVERRIDE=""
 BACKUP_DIR="/var/backups/jellyfin-updater"
 KEEP_BACKUPS=5
 LOG_FILE="/var/log/jellyfin-updater.log"
-
-# Health check
 HEALTH_PORT="8096"
-HEALTH_URL_PATH="/System/Info/Public"       # unauthenticated endpoint
+HEALTH_URL_PATH="/System/Info/Public"
 HEALTH_RETRIES=10
-HEALTH_DELAY=3
-
-# Email (leave MAIL_TO empty to disable emails)
+HEALTH_DELAY=30
 MAIL_TO=""
 MAIL_FROM="jellyfin-updater@$(hostname -f 2>/dev/null || hostname)"
-SMTP_URL=""                                 # e.g. smtp://mail.example.com:587 or smtps://mail.example.com:465
+SMTP_URL=""
 SMTP_USER=""
 SMTP_PASS=""
 
-
+# Runtime state
 SCRIPT_PATH="$(readlink -f "$0")"
-TMP_DIR=""
-ROLLBACK_READY=false
+TMP_DIR="" ROLLBACK_READY=false ROLLBACK_REASON=""
+ARCH="" BIN_PATH="" INSTALL_DIR="" DATA_DIR="" CURRENT_VER="" LATEST_VER="" BACKUP_FILE=""
+JELLYFIN_PROCESS_USER="" JELLYFIN_PROCESS_PID="" JELLYFIN_PROCESS_CMD=""
+RUNNING_VIA_SYSTEMD=true MIGRATE_TO_SYSTEMD=false
 
 # ============================================================================
 # Helpers
 # ============================================================================
 
-log() {
-  local line
-  line="$(date '+%Y-%m-%d %H:%M:%S') $*"
-  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
-  echo "$line" | tee -a "$LOG_FILE"
-}
-
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"; }
 cleanup() { [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
-# Send email notification via curl (SMTP)
-# Args: $1 = subject, $2 = body
 send_mail() {
-  local subject="$1" body="$2"
-
-  # Skip if email not configured
-  [ -z "$MAIL_TO" ] && return 0
-  [ -z "$SMTP_URL" ] && {
-    log "WARNING: MAIL_TO set but SMTP_URL not configured, skipping email"
-    return 0
-  }
-
-  local boundary="jfupdater-$$" msg
-  msg="$(mktemp)"
-
-  # Build MIME message with log attachment
-  {
-    echo "From: $MAIL_FROM"
-    echo "To: $MAIL_TO"
-    echo "Subject: $subject"
-    echo "MIME-Version: 1.0"
-    echo "Content-Type: multipart/mixed; boundary=\"$boundary\""
-    echo
-    echo "--$boundary"
-    echo "Content-Type: text/plain; charset=UTF-8"
-    echo
-    echo "$body"
-    echo
+  local subject="$1" body="${2:-}"
+  [ -z "$MAIL_TO" ] || [ -z "$SMTP_URL" ] && return 0
+  local boundary="jfupdater-$$" msg_file="$(mktemp)"
+  { echo "From: $MAIL_FROM"; echo "To: $MAIL_TO"; echo "Subject: $subject"
+    echo "MIME-Version: 1.0"; echo "Content-Type: multipart/mixed; boundary=\"$boundary\""; echo
+    echo "--$boundary"; echo "Content-Type: text/plain; charset=UTF-8"; echo; echo "$body"; echo
     echo "Log file: $LOG_FILE"
-    if [ -f "$LOG_FILE" ]; then
-      echo "--$boundary"
-      echo "Content-Type: text/plain; name=\"$(basename "$LOG_FILE")\""
-      echo "Content-Transfer-Encoding: base64"
-      echo "Content-Disposition: attachment; filename=\"$(basename "$LOG_FILE")\""
-      echo
-      base64 "$LOG_FILE"
-    fi
-    echo "--$boundary--"
-  } >"$msg"
-
-  # We're sending it easily via curl
-  local opts=(-s --url "$SMTP_URL" --mail-from "$MAIL_FROM" --mail-rcpt "$MAIL_TO" --upload-file "$msg")
-  [[ "$SMTP_URL" == smtp://* ]] && opts+=(--ssl-reqd)
-  [ -n "$SMTP_USER" ] && opts+=(--user "$SMTP_USER:$SMTP_PASS")
-
-  if ! curl "${opts[@]}" 2>/dev/null; then
-    log "WARNING: failed to send email (curl exit code: $?)"
-  fi
-  rm -f "$msg"
+    [ -f "$LOG_FILE" ] && { echo "--$boundary"; echo "Content-Type: text/plain; name=\"$(basename "$LOG_FILE")\""
+      echo "Content-Transfer-Encoding: base64"; echo "Content-Disposition: attachment; filename=\"$(basename "$LOG_FILE")\""; echo
+      base64 "$LOG_FILE"; }
+    echo "--$boundary--"; } >"$msg_file"
+  local curl_opts=(-s --url "$SMTP_URL" --mail-from "$MAIL_FROM" --mail-rcpt "$MAIL_TO" --upload-file "$msg_file")
+  [[ "$SMTP_URL" == smtp://* ]] && curl_opts+=(--ssl-reqd)
+  [ -n "$SMTP_USER" ] && curl_opts+=(--user "$SMTP_USER:$SMTP_PASS")
+  curl "${curl_opts[@]}" 2>/dev/null || log "WARNING: failed to send email"
+  rm -f "$msg_file"
 }
 
-# Error handler: logs, optionally rolls back, sends notification, exits
 die() {
   log "ERROR: $*"
-  if $ROLLBACK_READY; then
-    rollback "$*"
-  else
-    notify_failure "Failed to update to ver ${LATEST_VER:-?}, reason: $*"
-  fi
+  if $ROLLBACK_READY; then ROLLBACK_REASON="$*"; rollback
+  else send_mail "Failed to update to ver ${LATEST_VER:-?}, reason: $*"; fi
   exit 1
 }
-
-notify_failure() {
-  local subject="$1" body="${2:-}"
-  send_mail "$subject" "$body"
-}
-
 require_root() { [ "$(id -u)" -eq 0 ] || { echo "Please run as root." >&2; exit 1; }; }
 
+# ============================================================================
+# Process Detection & Management
+# ============================================================================
+
+detect_jellyfin_process() {
+  local match_pid match_user match_cmd
+  match_pid="$(pgrep -af jellyfin 2>/dev/null | grep -v "jellyfin-updater\|grep.*jellyfin" | grep -oE '^[0-9]+' | head -n1)"
+  [ -z "$match_pid" ] && return 1
+  match_user="$(ps -o user= -p "$match_pid" 2>/dev/null | tr -d ' ')"
+  match_cmd="$(ps -o args= -p "$match_pid" 2>/dev/null)"
+  [ -z "$match_user" ] || [ -z "$match_cmd" ] && return 1
+  JELLYFIN_PROCESS_PID="$match_pid"; JELLYFIN_PROCESS_USER="$match_user"; JELLYFIN_PROCESS_CMD="$match_cmd"
+  RUNNING_VIA_SYSTEMD=false
+  log "Detected jellyfin user process, PID=$match_pid, user=$match_user"
+}
+
+kill_jellyfin_process() {
+  [ -z "$JELLYFIN_PROCESS_PID" ] && return 0
+  log "Stopping jellyfin process (PID=$JELLYFIN_PROCESS_PID)..."
+  kill -TERM "$JELLYFIN_PROCESS_PID" 2>/dev/null
+  local attempt; for ((attempt=1; attempt<=30; attempt++)); do
+    kill -0 "$JELLYFIN_PROCESS_PID" 2>/dev/null || { log "Jellyfin process stopped"; return 0; }
+    sleep 1
+  done
+  log "Process did not stop gracefully, sending SIGKILL..."
+  kill -KILL "$JELLYFIN_PROCESS_PID" 2>/dev/null; sleep 1
+  kill -0 "$JELLYFIN_PROCESS_PID" 2>/dev/null && die "Failed to kill jellyfin process"
+  log "Jellyfin process killed"
+}
+
+ask_migrate_to_systemd() {
+  local response; echo -n "Jellyfin is running as a user process. Migrate to systemd? [Y/n]: "; read -r response
+  [[ "$response" =~ ^[Nn] ]] && return 1; return 0
+}
+
+create_systemd_service() {
+  local service_user="${JELLYFIN_PROCESS_USER:-root}" service_file="/etc/systemd/system/jellyfin.service"
+  log "Creating systemd service for user '$service_user'..."
+  cat > "$service_file" <<EOF
+[Unit]
+Description=Jellyfin Media Server
+After=network.target
+[Service]
+Type=simple
+User=$service_user
+Restart=always
+ExecStart=$BIN_PATH
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "$service_file"; systemctl daemon-reload; systemctl enable jellyfin.service 2>/dev/null
+  log "Systemd service created: $service_file"; RUNNING_VIA_SYSTEMD=true
+}
+
+stop_jellyfin() {
+  $RUNNING_VIA_SYSTEMD && { systemctl stop "$SERVICE_NAME" 2>/dev/null || true; return; }
+  kill_jellyfin_process 2>/dev/null
+}
+
+start_jellyfin() {
+  if $RUNNING_VIA_SYSTEMD; then systemctl start "$SERVICE_NAME" 2>/dev/null || true
+  else sudo -u "$JELLYFIN_PROCESS_USER" nohup $JELLYFIN_PROCESS_CMD &>/dev/null &
+    sleep 2; JELLYFIN_PROCESS_PID=$!
+  fi
+}
+
+# ============================================================================
 # Architecture & Installation Detection
-# Map uname -m to Jellyfin architecture strings
+# ============================================================================
+
 detect_arch() {
   case "$(uname -m)" in
-    x86_64)        echo "amd64" ;;
-    aarch64|arm64) echo "arm64" ;;
-    armv7l|armv6l) echo "armhf" ;;
+    x86_64) echo "amd64" ;; aarch64|arm64) echo "arm64" ;; armv7l|armv6l) echo "armhf" ;;
     *) die "Unsupported architecture: $(uname -m)" ;;
   esac
 }
 
-# Get ExecStart line from systemd unit, joining line continuations.
-# Tries multiple methods for robustness.
 unit_exec_line() {
   local exec_line unit_file
-
-  # Method 1: systemctl show (fastest, most reliable)
   exec_line="$(systemctl show -p ExecStart --value "$SERVICE_NAME" 2>/dev/null | head -n1)"
   [ -n "$exec_line" ] && [ "$exec_line" != "ExecStart=" ] && { echo "$exec_line"; return 0; }
-
-  # Method 2: systemctl cat with line-continuation joining
-  exec_line="$(systemctl cat "$SERVICE_NAME" 2>/dev/null \
-    | sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' \
-    | sed -n 's/^ExecStart=//p' | head -n1)"
+  exec_line="$(systemctl cat "$SERVICE_NAME" 2>/dev/null | sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' | sed -n 's/^ExecStart=//p' | head -n1)"
   [ -n "$exec_line" ] && { echo "$exec_line"; return 0; }
-
-  # Method 3: read unit file directly via FragmentPath
   unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME" 2>/dev/null)"
   [ -f "$unit_file" ] || return 1
-  exec_line="$(sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' "$unit_file" \
-    | sed -n 's/^ExecStart=//p' | head -n1)"
-  echo "$exec_line"
+  sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' "$unit_file" | sed -n 's/^ExecStart=//p' | head -n1
 }
 
-# Detect binary path, install directory, and data directory from systemd unit.
-# Handles both direct binary ExecStart and wrapper-script patterns.
-# The regex here is precise for Jellyfin's wrapper script format.
-find_installation() {
-  local exec_line target invocation
-
-  exec_line="$(unit_exec_line)"
-  if [ -z "$exec_line" ]; then
-    # Debug: show what systemctl knows about the service
-    local status
-    status="$(systemctl status "$SERVICE_NAME" 2>&1 | head -20)"
-    log "DEBUG: systemctl status for '$SERVICE_NAME':\n$status"
-    die "Could not determine ExecStart of service '$SERVICE_NAME' (service may not exist or be named differently)"
-  fi
-
-  target="$(awk '{print $1}' <<<"$exec_line")"
-  [ -f "$target" ] || die "ExecStart target '$target' does not exist"
-
-  # If target is ELF binary, use ExecStart directly
-  if file "$target" | grep -qi 'ELF'; then
-    invocation="$exec_line"
-  else
-    # Wrapper script: source simple VAR=value lines, then find the jellyfin invocation
-    local vars joined raw
-    vars="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=[^$`;&|]*$' "$target")"
-    eval "$vars" 2>/dev/null
-    joined="$(sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' "$target")"
-
-    # Match: jellyfin binary path (with optional leading whitespace, not part of another word)
-    raw="$(grep -m1 -E '(^|[[:space:]])[^[:space:]]*/jellyfin([[:space:]]|$)' <<<"$joined")"
-    [ -z "$raw" ] && die "Could not find the jellyfin binary in wrapper script '$target'"
-    eval "invocation=\"$raw\"" 2>/dev/null
-  fi
-
+extract_paths_from_invocation() {
+  local invocation="$1"
   BIN_PATH="$(awk '{print $1}' <<<"$invocation")"
-  [ -x "$BIN_PATH" ] || die "Detected jellyfin binary '$BIN_PATH' is not executable"
+  [ -x "$BIN_PATH" ] || die "Binary '$BIN_PATH' is not executable"
   INSTALL_DIR="$(dirname "$BIN_PATH")"
-
-  # Extract data directory from -d/--datadir flags in invocation
-  DATA_DIR="$(sed -nE \
-    's/.*(^|[[:space:]])-d ([^[:space:]]+).*/\2/p;
-     s/.*--datadir[= ]([^[:space:]]+).*/\1/p' <<<"$invocation" | tail -n1)"
+  DATA_DIR="$(sed -nE 's/.*(^|[[:space:]])-d ([^[:space:]]+).*/\2/p; s/.*--datadir[= ]([^[:space:]]+).*/\1/p' <<<"$invocation" | tail -n1)"
   [ -n "$DATA_DIR_OVERRIDE" ] && DATA_DIR="$DATA_DIR_OVERRIDE"
   [ -z "$DATA_DIR" ] && DATA_DIR="/var/lib/jellyfin"
+}
 
-  # Safety: reject package-manager installations
-  if command -v dpkg >/dev/null 2>&1 && dpkg -S "$BIN_PATH" >/dev/null 2>&1; then
-    die "'$BIN_PATH' is managed by dpkg – please update via apt instead"
+find_installation() {
+  local exec_line exec_target invocation
+
+  # Try systemd service first
+  if systemctl cat "$SERVICE_NAME" &>/dev/null || systemctl cat jellyfin &>/dev/null; then
+    if ! systemctl cat "$SERVICE_NAME" &>/dev/null; then
+      local candidate; for candidate in jellyfin jellyfin-server jellyfin-generic; do
+        if systemctl cat "$candidate" &>/dev/null; then SERVICE_NAME="$candidate"; log "Using service '$candidate'"; break; fi
+      done
+    fi
+    exec_line="$(unit_exec_line)"
+    if [ -n "$exec_line" ]; then
+      exec_target="$(awk '{print $1}' <<<"$exec_line")"
+      [ -f "$exec_target" ] || { log "ExecStart target '$exec_target' not found"; exec_line=""; }
+    fi
+    if [ -n "$exec_line" ]; then
+      if file "$exec_target" | grep -qi 'ELF'; then invocation="$exec_line"
+      else
+        invocation="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=[^$`;&|]*$' "$exec_target")"; eval "$invocation" 2>/dev/null
+        invocation="$(sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' "$exec_target")"
+        invocation="$(grep -m1 -E '(^|[[:space:]])[^[:space:]]*/jellyfin([[:space:]]|$)' <<<"$invocation")"
+        [ -z "$invocation" ] && die "Could not find jellyfin binary in wrapper script '$exec_target'"
+        eval "invocation=\"$invocation\"" 2>/dev/null
+      fi
+      extract_paths_from_invocation "$invocation"
+      RUNNING_VIA_SYSTEMD=true
+      log "Detected: binary=$BIN_PATH install_dir=$INSTALL_DIR data_dir=$DATA_DIR (via systemd)"
+      return 0
+    fi
   fi
-  if command -v rpm >/dev/null 2>&1 && rpm -qf "$BIN_PATH" >/dev/null 2>&1; then
-    die "'$BIN_PATH' is managed by rpm – please update via dnf/yum instead"
-  fi
 
-  log "Detected: binary=$BIN_PATH install_dir=$INSTALL_DIR data_dir=$DATA_DIR"
-}
-
-# Version & Download
-current_version() {
-  "$BIN_PATH" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
-}
-
-latest_version() {
-  curl -fsSL https://api.github.com/repos/jellyfin/jellyfin/releases/latest \
-    | grep -m1 '"tag_name"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'
-}
-
-download_package() {
-  local version="$1" arch="$2" dest="$3"
-  local dir="https://repo.jellyfin.org/files/server/linux/latest-stable/${arch}/"
-
-  # Try direct versioned URL first
-  if curl -fsSL -o "$dest" "${dir}jellyfin_${version}-${arch}.tar.gz"; then
+  # Try running user process
+  if detect_jellyfin_process; then
+    extract_paths_from_invocation "$JELLYFIN_PROCESS_CMD"
+    log "Detected: binary=$BIN_PATH install_dir=$INSTALL_DIR data_dir=$DATA_DIR (via user process)"
     return 0
   fi
 
+  die "Could not find Jellyfin installation (no systemd service or running process found)"
+}
+
+# ============================================================================
+# Version, Download, Backup, Deploy, Health
+# ============================================================================
+
+current_version() { "$BIN_PATH" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1; }
+latest_version() { curl -fsSL https://api.github.com/repos/jellyfin/jellyfin/releases/latest | grep -m1 '"tag_name"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'; }
+
+download_package() {
+  local dest="$TMP_DIR/jellyfin.tar.gz" dir="https://repo.jellyfin.org/files/server/linux/latest-stable/${ARCH}/"
+  curl -fsSL -o "$dest" "${dir}jellyfin_${LATEST_VER}-${ARCH}.tar.gz" && return 0
   log "Direct download failed, trying directory listing as a fallback"
-  local found
-  found="$(curl -fsSL "$dir" | grep -oE "jellyfin_[0-9.]+-${arch}\.tar\.gz" | sort -V | tail -n1)"
+  local found; found="$(curl -fsSL "$dir" | grep -oE "jellyfin_[0-9.]+-${ARCH}\.tar\.gz" | sort -V | tail -n1)"
   [ -z "$found" ] && return 1
   curl -fsSL -o "$dest" "${dir}${found}"
 }
 
-# Backup & Rollback
 backup() {
   mkdir -p "$BACKUP_DIR"
   BACKUP_FILE="$BACKUP_DIR/jellyfin-backup-$(date '+%Y%m%d-%H%M%S').tar.gz"
-  tar czf "$BACKUP_FILE" --absolute-names "$INSTALL_DIR" "$DATA_DIR" 2>>"$LOG_FILE" \
-    || die "Backup failed"
+  tar czf "$BACKUP_FILE" --absolute-names "$INSTALL_DIR" "$DATA_DIR" 2>>"$LOG_FILE" || die "Backup failed"
   log "Backup created: $BACKUP_FILE"
-
-  # Prune old backups
-  ls -1t "$BACKUP_DIR"/jellyfin-backup-*.tar.gz 2>/dev/null \
-    | tail -n "+$((KEEP_BACKUPS + 1))" | xargs -r rm -f
+  ls -1t "$BACKUP_DIR"/jellyfin-backup-*.tar.gz 2>/dev/null | tail -n "+$((KEEP_BACKUPS + 1))" | xargs -r rm -f
 }
 
 rollback() {
-  log "Rolling back (reason: $1)"
-  systemctl stop "$SERVICE_NAME" 2>/dev/null
+  log "Rolling back (reason: $ROLLBACK_REASON)"; stop_jellyfin
   rm -rf "$INSTALL_DIR" "$DATA_DIR"
   tar xzf "$BACKUP_FILE" -C / || log "ERROR: failed to restore backup"
-  systemctl start "$SERVICE_NAME" 2>/dev/null
-  notify_failure "Failed to update to ver ${LATEST_VER}, reason: $1" \
-"Trying to update from ver ${CURRENT_VER} to ver ${LATEST_VER}
-Failed to update to ver ${LATEST_VER}, reason: $1
-Rolled back to ver ${CURRENT_VER}."
+  start_jellyfin
+  send_mail "Failed to update to ver ${LATEST_VER}" \
+"Trying to update from ver $CURRENT_VER to ver $LATEST_VER
+Failed to update to ver $LATEST_VER, reason: $ROLLBACK_REASON
+Rolled back to ver $CURRENT_VER."
 }
 
-# Deploy & Health Check
 deploy() {
-  local pkg="$1" extract_dir="$TMP_DIR/extract"
-  mkdir -p "$extract_dir"
-  tar xzf "$pkg" -C "$extract_dir" || die "Could not extract package"
-
-  # Find the ELF jellyfin binary in extracted package
-  local new_bin
-  new_bin="$(find "$extract_dir" -type f -name jellyfin \
-    -exec sh -c 'file "$1" | grep -qi ELF' _ {} \; -print | head -n1)"
-  [ -z "$new_bin" ] && die "Could not find the jellyfin binary in the downloaded package"
-
-  local pkg_root owner
-  pkg_root="$(dirname "$new_bin")"
-  owner="$(stat -c '%U:%G' "$INSTALL_DIR" 2>/dev/null || echo "root:root")"
-
+  local extract_dir="$TMP_DIR/extract" new_bin pkg_root owner new_bin_final
+  mkdir -p "$extract_dir"; tar xzf "$TMP_DIR/jellyfin.tar.gz" -C "$extract_dir" || die "Could not extract package"
+  new_bin="$(find "$extract_dir" -type f -name jellyfin -exec sh -c 'file "$1" | grep -qi ELF' _ {} \; -print | head -n1)"
+  [ -z "$new_bin" ] && die "Could not find jellyfin binary in downloaded package"
+  pkg_root="$(dirname "$new_bin")"; owner="$(stat -c '%U:%G' "$INSTALL_DIR" 2>/dev/null || echo "root:root")"
   rsync -a --delete "$pkg_root"/ "$INSTALL_DIR"/ || die "Could not deploy new version"
   chown -R "$owner" "$INSTALL_DIR" 2>/dev/null || true
-
-  # If binary path changed, update systemd unit
-  local new_bin_final="$INSTALL_DIR/$(basename "$new_bin")"
-  if [ "$new_bin_final" != "$BIN_PATH" ]; then
+  new_bin_final="$INSTALL_DIR/$(basename "$new_bin")"
+  if [ "$new_bin_final" != "$BIN_PATH" ] && $RUNNING_VIA_SYSTEMD; then
     log "Binary path changed ($BIN_PATH -> $new_bin_final), updating systemd unit"
-    local unit_file
-    unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME")"
-    sed -i "s#$BIN_PATH#$new_bin_final#" "$unit_file"
-    systemctl daemon-reload
-    BIN_PATH="$new_bin_final"
+    local unit_file; unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME")"
+    sed -i "s#$BIN_PATH#$new_bin_final#" "$unit_file"; systemctl daemon-reload; BIN_PATH="$new_bin_final"
   fi
 }
 
 health_check() {
-  local url="http://127.0.0.1:${HEALTH_PORT}${HEALTH_URL_PATH}" i
-  for ((i = 1; i <= HEALTH_RETRIES; i++)); do
-    if curl -fsS "$url" 2>/dev/null | grep -q "\"Version\":\"$LATEST_VER\""; then
-      return 0
-    fi
+  local url="http://127.0.0.1:${HEALTH_PORT}${HEALTH_URL_PATH}" attempt
+  for ((attempt=1; attempt<=HEALTH_RETRIES; attempt++)); do
+    curl -fsS "$url" 2>/dev/null | grep -q "\"Version\":\"$LATEST_VER\"" && return 0
     sleep "$HEALTH_DELAY"
-  done
-  return 1
+  done; return 1
 }
 
+# ============================================================================
 # Main Flow
+# ============================================================================
+
 run_update() {
-  require_root
-  TMP_DIR="$(mktemp -d)"
-
-  ARCH="$(detect_arch)"
-  find_installation
-
+  require_root; TMP_DIR="$(mktemp -d)"; ARCH="$(detect_arch)"; find_installation
   CURRENT_VER="$(current_version)"
   [ -z "$CURRENT_VER" ] && die "Could not determine the currently installed Jellyfin version"
   LATEST_VER="$(latest_version)"
   [ -z "$LATEST_VER" ] && die "Could not determine the latest version from GitHub"
-
-  if [ "$CURRENT_VER" = "$LATEST_VER" ]; then
-    log "Already up to date (version $CURRENT_VER) – no update needed"
-    exit 0
-  fi
-
+  [ "$CURRENT_VER" = "$LATEST_VER" ] && { log "Already up to date (version $CURRENT_VER)"; exit 0; }
   log "Trying to update from ver $CURRENT_VER to ver $LATEST_VER"
-
-  local pkg="$TMP_DIR/jellyfin.tar.gz"
-  download_package "$LATEST_VER" "$ARCH" "$pkg" \
-    || die "Download of version $LATEST_VER (architecture $ARCH) failed"
-
-  backup
-  ROLLBACK_READY=true
-
-  systemctl stop "$SERVICE_NAME" || die "Could not stop the service"
-  deploy "$pkg"
-  systemctl start "$SERVICE_NAME" || die "Could not start the service"
-
+  download_package || die "Download of version $LATEST_VER (architecture $ARCH) failed"
+  backup; ROLLBACK_READY=true
+  if ! $RUNNING_VIA_SYSTEMD; then
+    ([ "$MIGRATE_TO_SYSTEMD" = true ] || ask_migrate_to_systemd) && create_systemd_service
+  fi
+  stop_jellyfin; deploy; start_jellyfin
   if health_check; then
     log "Updated successfully to ver $LATEST_VER"
-    send_mail "Updated successfully to ver $LATEST_VER" \
-"Trying to update from ver $CURRENT_VER to ver $LATEST_VER
-Updated successfully to ver $LATEST_VER"
+    send_mail "Updated successfully to ver $LATEST_VER" "Updated from $CURRENT_VER to $LATEST_VER"
     exit 0
-  else
-    die "Health check after update failed (service is not responding as expected)"
-  fi
+  else die "Health check after update failed"; fi
 }
 
 install_cron() {
-  require_root
-  local schedule="${1:-0 4 * * *}"
-  local cron_file="/etc/cron.d/jellyfin-updater"
+  require_root; local schedule="${1:-0 4 * * *}" cron_file="/etc/cron.d/jellyfin-updater"
   echo "$schedule root $SCRIPT_PATH --update >> $LOG_FILE 2>&1" > "$cron_file"
-  chmod 644 "$cron_file"
-  log "Cronjob installed: $cron_file ('$schedule')"
+  chmod 644 "$cron_file"; log "Cronjob installed: $cron_file ('$schedule')"
 }
 
+# ============================================================================
 # Entry Point
+# ============================================================================
+
 case "${1:-}" in
-  --update|"")
-    run_update
-    ;;
-  --install-cron)
-    install_cron "${2:-}"
-    ;;
-  --help|-h)
-    cat <<EOF
-Usage: $(basename "$0") [--update] [--install-cron ["CRON_SCHEDULE"]] [--help]
-
-  --update        Run a one-off update (default, requires root)
-  --install-cron  Set up a cronjob, default schedule: "0 4 * * *"
-                  Example: $(basename "$0") --install-cron "0 3 * * 0"
-  --help          Show this help
-
-Configuration (paths, SMTP credentials, health check, backups) can be
-adjusted at the top of this script.
+  --update|"") run_update ;;
+  --update-migrate) MIGRATE_TO_SYSTEMD=true; run_update ;;
+  --install-cron) install_cron "${2:-}" ;;
+  --help|-h) cat <<EOF
+Usage: $(basename "$0") [--update] [--update-migrate] [--install-cron ["CRON_SCHEDULE"]] [--help]
+  --update          Run a one-off update (default, requires root)
+  --update-migrate  Update and migrate user process to systemd service
+  --install-cron    Set up a cronjob, default schedule: "0 4 * * *"
+  --help            Show this help
 EOF
-    ;;
-  *)
-    echo "Unknown option: $1" >&2
-    exit 1
-    ;;
+  ;; *) echo "Unknown option: $1" >&2; exit 1 ;;
 esac
