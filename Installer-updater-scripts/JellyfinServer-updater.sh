@@ -32,9 +32,10 @@ SMTP_PASS=""
 # Runtime state
 SCRIPT_PATH="$(readlink -f "$0")"
 TMP_DIR="" ROLLBACK_READY=false ROLLBACK_REASON=""
-ARCH="" BIN_PATH="" INSTALL_DIR="" DATA_DIR="" CURRENT_VER="" LATEST_VER="" BACKUP_FILE=""
+ARCH="" BIN_PATH="" INSTALL_DIR="" DATA_DIR="" CONFIG_DIR="" LOG_DIR="" CACHE_DIR=""
+CURRENT_VER="" LATEST_VER="" BACKUP_FILE=""
 JELLYFIN_PROCESS_USER="" JELLYFIN_PROCESS_PID="" JELLYFIN_PROCESS_CMD=""
-RUNNING_VIA_SYSTEMD=true MIGRATE_TO_SYSTEMD=false
+RUNNING_VIA_SYSTEMD=true MIGRATE_TO_SYSTEMD=false MIGRATED_FROM_USER=false
 
 # ============================================================================
 # Helpers
@@ -109,20 +110,44 @@ ask_migrate_to_systemd() {
 create_systemd_service() {
   local service_user="${JELLYFIN_PROCESS_USER:-root}" service_file="/etc/systemd/system/jellyfin.service"
   log "Creating systemd service for user '$service_user'..."
+  mkdir -p "$DATA_DIR" "$CONFIG_DIR" "$LOG_DIR" "$CACHE_DIR"
   cat > "$service_file" <<EOF
 [Unit]
 Description=Jellyfin Media Server
-After=network.target
+After=network-online.target
+Wants=network-online.target
+
 [Service]
 Type=simple
 User=$service_user
-Restart=always
-ExecStart=$BIN_PATH
+Group=$service_user
+WorkingDirectory=$INSTALL_DIR
+Environment=JELLYFIN_DATA_DIR=$DATA_DIR
+Environment=JELLYFIN_CONFIG_DIR=$CONFIG_DIR
+Environment=JELLYFIN_LOG_DIR=$LOG_DIR
+Environment=JELLYFIN_CACHE_DIR=$CACHE_DIR
+ExecStart=$BIN_PATH --datadir $DATA_DIR --configdir $CONFIG_DIR --logdir $LOG_DIR --cachedir $CACHE_DIR
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=$DATA_DIR $CONFIG_DIR $LOG_DIR $CACHE_DIR $INSTALL_DIR
+
 [Install]
 WantedBy=multi-user.target
 EOF
   chmod 644 "$service_file"; systemctl daemon-reload; systemctl enable jellyfin.service 2>/dev/null
   log "Systemd service created: $service_file"; RUNNING_VIA_SYSTEMD=true
+}
+
+fix_permissions() {
+  local service_user="${JELLYFIN_PROCESS_USER:-root}"
+  chown -R "$service_user:$service_user" "$DATA_DIR" "$CONFIG_DIR" "$LOG_DIR" "$CACHE_DIR" 2>/dev/null || true
+  [ -d "$INSTALL_DIR" ] && chown -R "$service_user:$service_user" "$INSTALL_DIR" 2>/dev/null || true
 }
 
 stop_jellyfin() {
@@ -162,12 +187,12 @@ detect_arch() {
 }
 
 unit_exec_line() {
-  local exec_line unit_file
+  local exec_line
   exec_line="$(systemctl show -p ExecStart --value "$SERVICE_NAME" 2>/dev/null | head -n1)"
   [ -n "$exec_line" ] && [ "$exec_line" != "ExecStart=" ] && { echo "$exec_line"; return 0; }
   exec_line="$(systemctl cat "$SERVICE_NAME" 2>/dev/null | sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' | sed -n 's/^ExecStart=//p' | head -n1)"
   [ -n "$exec_line" ] && { echo "$exec_line"; return 0; }
-  unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME" 2>/dev/null)"
+  local unit_file; unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME" 2>/dev/null)"
   [ -f "$unit_file" ] || return 1
   sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' "$unit_file" | sed -n 's/^ExecStart=//p' | head -n1
 }
@@ -175,11 +200,21 @@ unit_exec_line() {
 extract_paths_from_invocation() {
   local invocation="$1"
   BIN_PATH="$(awk '{print $1}' <<<"$invocation")"
+  if [ -n "${JELLYFIN_PROCESS_PID:-}" ]; then
+    local resolved; resolved="$(readlink -f "/proc/$JELLYFIN_PROCESS_PID/exe" 2>/dev/null)"
+    [ -n "$resolved" ] && BIN_PATH="$resolved"
+  fi
   [ -x "$BIN_PATH" ] || die "Binary '$BIN_PATH' is not executable"
   INSTALL_DIR="$(dirname "$BIN_PATH")"
   DATA_DIR="$(sed -nE 's/.*(^|[[:space:]])-d ([^[:space:]]+).*/\2/p; s/.*--datadir[= ]([^[:space:]]+).*/\1/p' <<<"$invocation" | tail -n1)"
+  CONFIG_DIR="$(sed -nE 's/.*(^|[[:space:]])-c ([^[:space:]]+).*/\2/p; s/.*--configdir[= ]([^[:space:]]+).*/\1/p' <<<"$invocation" | tail -n1)"
+  LOG_DIR="$(sed -nE 's/.*(^|[[:space:]])-l ([^[:space:]]+).*/\2/p; s/.*--logdir[= ]([^[:space:]]+).*/\1/p' <<<"$invocation" | tail -n1)"
+  CACHE_DIR="$(sed -nE 's/.*(^|[[:space:]])-C ([^[:space:]]+).*/\2/p; s/.*--cachedir[= ]([^[:space:]]+).*/\1/p' <<<"$invocation" | tail -n1)"
   [ -n "$DATA_DIR_OVERRIDE" ] && DATA_DIR="$DATA_DIR_OVERRIDE"
   [ -z "$DATA_DIR" ] && DATA_DIR="/var/lib/jellyfin"
+  [ -z "$CONFIG_DIR" ] && CONFIG_DIR="$DATA_DIR/config"
+  [ -z "$LOG_DIR" ] && LOG_DIR="$DATA_DIR/log"
+  [ -z "$CACHE_DIR" ] && CACHE_DIR="$DATA_DIR/cache"
 }
 
 find_installation() {
@@ -262,6 +297,13 @@ backup() {
 
 rollback() {
   log "Rolling back (reason: $ROLLBACK_REASON)"; stop_jellyfin
+  if $MIGRATED_FROM_USER; then
+    log "Reverting migration: disabling systemd service and restoring user process"
+    systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+    rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+    systemctl daemon-reload 2>/dev/null || true
+    RUNNING_VIA_SYSTEMD=false
+  fi
   rm -rf "$INSTALL_DIR" "$DATA_DIR"
   tar xzf "$BACKUP_FILE" -C / || log "ERROR: failed to restore backup"
   start_jellyfin
@@ -272,19 +314,22 @@ Rolled back to ver $CURRENT_VER."
 }
 
 deploy() {
-  local extract_dir="$TMP_DIR/extract" new_bin pkg_root owner new_bin_final
+  local extract_dir="$TMP_DIR/extract" new_bin pkg_root new_bin_final
   mkdir -p "$extract_dir"; tar xzf "$TMP_DIR/jellyfin.tar.gz" -C "$extract_dir" || die "Could not extract package"
   new_bin="$(find "$extract_dir" -type f -name jellyfin -exec sh -c 'file "$1" | grep -qi ELF' _ {} \; -print | head -n1)"
   [ -z "$new_bin" ] && die "Could not find jellyfin binary in downloaded package"
-  pkg_root="$(dirname "$new_bin")"; owner="$(stat -c '%U:%G' "$INSTALL_DIR" 2>/dev/null || echo "root:root")"
+  pkg_root="$(dirname "$new_bin")"
   rsync -a --delete "$pkg_root"/ "$INSTALL_DIR"/ || die "Could not deploy new version"
-  chown -R "$owner" "$INSTALL_DIR" 2>/dev/null || true
   new_bin_final="$INSTALL_DIR/$(basename "$new_bin")"
+  [ -x "$new_bin_final" ] || die "Deployed binary not executable: $new_bin_final"
   if [ "$new_bin_final" != "$BIN_PATH" ] && $RUNNING_VIA_SYSTEMD; then
     log "Binary path changed ($BIN_PATH -> $new_bin_final), updating systemd unit"
     local unit_file; unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME")"
-    sed -i "s#$BIN_PATH#$new_bin_final#" "$unit_file"; systemctl daemon-reload; BIN_PATH="$new_bin_final"
+    sed -i "s|^ExecStart=$BIN_PATH |ExecStart=$new_bin_final |" "$unit_file"
+    systemctl daemon-reload; BIN_PATH="$new_bin_final"
   fi
+  BIN_PATH="$new_bin_final"
+  INSTALL_DIR="$(dirname "$BIN_PATH")"
 }
 
 health_check() {
@@ -314,6 +359,11 @@ health_check() {
 
 run_update() {
   require_root; TMP_DIR="$(mktemp -d)"; ARCH="$(detect_arch)"; find_installation
+  # Fix overlapping data/config dirs — Jellyfin 10.11+ / v12 refuses to start if both markers share a directory
+  if [ "$CONFIG_DIR" = "$DATA_DIR" ]; then
+    log "WARNING: Data and config directories overlap ($CONFIG_DIR). Separating config to $DATA_DIR/config for v12+ compatibility."
+    CONFIG_DIR="$DATA_DIR/config"
+  fi
   CURRENT_VER="$(current_version)"
   [ -z "$CURRENT_VER" ] && die "Could not determine the currently installed Jellyfin version"
   LATEST_VER="$(latest_version)"
@@ -323,9 +373,22 @@ run_update() {
   download_package || die "Download of version $LATEST_VER (architecture $ARCH) failed"
   backup; ROLLBACK_READY=true
   if ! $RUNNING_VIA_SYSTEMD; then
-    ([ "$MIGRATE_TO_SYSTEMD" = true ] || ask_migrate_to_systemd) && create_systemd_service
+    ([ "$MIGRATE_TO_SYSTEMD" = true ] || ask_migrate_to_systemd) && {
+      MIGRATED_FROM_USER=true
+      stop_jellyfin
+    }
+  else
+    stop_jellyfin
   fi
-  stop_jellyfin; deploy; start_jellyfin
+  deploy
+  if $MIGRATED_FROM_USER; then
+    create_systemd_service
+  fi
+  fix_permissions
+  [ -x "$BIN_PATH" ] || die "Binary '$BIN_PATH' not found after deploy"
+  log "Deploy complete: binary=$BIN_PATH install_dir=$INSTALL_DIR"
+  log "Verify binary exists: $(ls -la "$BIN_PATH" 2>&1)"
+  start_jellyfin
   log "Server started. Note: Jellyfin 12.x may take several minutes for database migrations on first startup."
   if health_check; then
     log "Updated successfully to ver $LATEST_VER"
