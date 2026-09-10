@@ -334,9 +334,18 @@ deploy() {
 
 health_check() {
   local url="http://127.0.0.1:${HEALTH_PORT}${HEALTH_URL_PATH}" attempt
+  local expected_version="$LATEST_VER"
+  log "Health check: looking for Version=$expected_version at $url"
+  log "Health check: LATEST_VER hex=$(printf '%s' "$expected_version" | xxd -p)"
   for ((attempt=1; attempt<=HEALTH_RETRIES; attempt++)); do
     log "Health check attempt $attempt/$HEALTH_RETRIES..."
-    if curl -fsS "$url" 2>/dev/null | grep -q "\"Version\":\"$LATEST_VER\""; then
+    local response
+    response="$(curl -fsS "$url" 2>/dev/null)" || { log "Health check: could not reach $url"; sleep "$HEALTH_DELAY"; continue; }
+    log "Health check: response=$response"
+    local server_version
+    server_version="$(echo "$response" | sed -n 's/.*"Version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    log "Health check: server_version=$server_version expected=$expected_version"
+    if [ "$server_version" = "$expected_version" ]; then
       log "Health check passed on attempt $attempt"
       return 0
     fi
