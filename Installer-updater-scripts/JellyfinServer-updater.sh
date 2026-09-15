@@ -188,17 +188,23 @@ detect_arch() {
 
 unit_exec_line() {
   local exec_line
-  exec_line="$(systemctl show -p ExecStart --value "$SERVICE_NAME" 2>/dev/null | head -n1)"
-  if [ -n "$exec_line" ] && [ "$exec_line" != "ExecStart=" ]; then
-    # systemctl show wraps the value in { ... } — strip the braces
-    exec_line="${exec_line#\{}"; exec_line="${exec_line%\}}"
-    echo "$exec_line"; return 0
-  fi
+  # 1) systemctl cat — gives the raw ExecStart= line from the unit file (most reliable)
   exec_line="$(systemctl cat "$SERVICE_NAME" 2>/dev/null | sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' | sed -n 's/^ExecStart=//p' | head -n1)"
   [ -n "$exec_line" ] && { echo "$exec_line"; return 0; }
+  # 2) Read the unit file directly
   local unit_file; unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME" 2>/dev/null)"
-  [ -f "$unit_file" ] || return 1
-  sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' "$unit_file" | sed -n 's/^ExecStart=//p' | head -n1
+  if [ -f "$unit_file" ]; then
+    exec_line="$(sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' "$unit_file" | sed -n 's/^ExecStart=//p' | head -n1)"
+    [ -n "$exec_line" ] && { echo "$exec_line"; return 0; }
+  fi
+  # 3) systemctl show — structured format: { path=/bin/foo ; argv[] = /bin/foo arg1 arg2 ; ... }
+  #    Extract argv[] which contains the real command line
+  exec_line="$(systemctl show -p ExecStart --value "$SERVICE_NAME" 2>/dev/null | head -n1)"
+  if [ -n "$exec_line" ] && [[ "$exec_line" == *"argv["* ]]; then
+    exec_line="$(sed 's/.*argv\[\] *= *//;s/ ;.*//' <<<"$exec_line")"
+    [ -n "$exec_line" ] && { echo "$exec_line"; return 0; }
+  fi
+  return 1
 }
 
 extract_paths_from_invocation() {
