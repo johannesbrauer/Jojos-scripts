@@ -355,7 +355,8 @@ health_check() {
     local server_version
     server_version="$(echo "$response" | sed -n 's/.*"Version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
     log "Health check: server_version=$server_version expected=$expected_version"
-    if [ "$server_version" = "$expected_version" ]; then
+    local sv_norm="${server_version%%.0}" ev_norm="${expected_version%%.0}"
+    if [ "$sv_norm" = "$ev_norm" ]; then
       log "Health check passed on attempt $attempt"
       return 0
     fi
