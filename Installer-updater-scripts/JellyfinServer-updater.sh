@@ -189,7 +189,11 @@ detect_arch() {
 unit_exec_line() {
   local exec_line
   exec_line="$(systemctl show -p ExecStart --value "$SERVICE_NAME" 2>/dev/null | head -n1)"
-  [ -n "$exec_line" ] && [ "$exec_line" != "ExecStart=" ] && { echo "$exec_line"; return 0; }
+  if [ -n "$exec_line" ] && [ "$exec_line" != "ExecStart=" ]; then
+    # systemctl show wraps the value in { ... } — strip the braces
+    exec_line="${exec_line#\{}"; exec_line="${exec_line%\}}"
+    echo "$exec_line"; return 0
+  fi
   exec_line="$(systemctl cat "$SERVICE_NAME" 2>/dev/null | sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' | sed -n 's/^ExecStart=//p' | head -n1)"
   [ -n "$exec_line" ] && { echo "$exec_line"; return 0; }
   local unit_file; unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME" 2>/dev/null)"
@@ -380,15 +384,13 @@ run_update() {
   [ "$CURRENT_VER" = "$LATEST_VER" ] && { log "Already up to date (version $CURRENT_VER)"; exit 0; }
   log "Trying to update from ver $CURRENT_VER to ver $LATEST_VER"
   download_package || die "Download of version $LATEST_VER (architecture $ARCH) failed"
-  backup; ROLLBACK_READY=true
   if ! $RUNNING_VIA_SYSTEMD; then
     ([ "$MIGRATE_TO_SYSTEMD" = true ] || ask_migrate_to_systemd) && {
       MIGRATED_FROM_USER=true
-      stop_jellyfin
     }
-  else
-    stop_jellyfin
   fi
+  stop_jellyfin
+  backup; ROLLBACK_READY=true
   deploy
   if $MIGRATED_FROM_USER; then
     create_systemd_service
