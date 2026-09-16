@@ -10,7 +10,7 @@
 # ==============================================================================
 set -euo pipefail
 
-# ---------- 1. CONFIGURATION (edit these) -------------------------------------
+# ---------- CONFIGURATION (edit these) -------------------------------------
 NAS_PATH="/mnt/nas/media"          # Existing NAS mount, ONE shared area
 WG_CONF_SRC="/root/vpn.conf"       # Any standard WireGuard .conf from ANY provider
 LAN_SUBNET="192.168.0.0/24"        # Your home network, adjust if different
@@ -22,7 +22,7 @@ NS_NAME="vpnns"
 VETH_HOST_IP="10.200.200.1/30"
 VETH_NS_IP="10.200.200.2"
 
-# ---------- 2. PRE-FLIGHT CHECKS ----------------------------------------------
+# ---------- PRE-FLIGHT CHECKS ----------------------------------------------
 [[ $EUID -eq 0 ]] || { echo "Please run as root."; exit 1; }
 [[ -d "$NAS_PATH" ]] || { echo "ERROR: $NAS_PATH does not exist."; exit 1; }
 [[ -f "$WG_CONF_SRC" ]] || { echo "ERROR: WireGuard config not found at $WG_CONF_SRC.
@@ -41,22 +41,20 @@ apt-get update -qq
 apt-get install -y wireguard-tools iproute2 iptables curl git jq openssl \
   ca-certificates build-essential python3 make g++ qbittorrent-nox >/dev/null
 
-# ---------- 3. NAS FOLDER STRUCTURE + SHARED GROUP ----------------------------
+# ---------- NAS FOLDER STRUCTURE + SHARED GROUP ----------------------------
 echo "==> Creating NAS folder structure..."
 # Downloads AND finished media live in the SAME share -> required for hardlinks.
 mkdir -p "$NAS_PATH"/{downloads/incomplete,downloads/complete,movies,tv,music,books}
 
-# WHY a shared group ("medianas")?
 # qBittorrent (user qbtuser) writes the downloaded files. Radarr/Sonarr/etc.
-# (user mediasvc) then need to read those same files to create a hardlink into
-# movies/tv/etc. Two different Linux users writing/reading the same NAS folder
-# only works cleanly if both belong to one shared group that owns the folder,
+# (user mediasvc) then need to read those same files to create a hardlink into movies/tv/etc. 
+# Two different Linux users writing/reading the same NAS folder only works cleanly if both belong to one shared group that owns the folder,
 # with the setgid bit so new files/folders automatically inherit that group.
 groupadd -f medianas
 chgrp -R medianas "$NAS_PATH"
 chmod -R 2775 "$NAS_PATH"
 
-# ---------- 4. SERVICE USERS ---------------------------------------------------
+# ---------- SERVICE USERS ---------------------------------------------------
 # qbtuser  : isolated, unprivileged, no login - runs ONLY qBittorrent.
 #            This user's process is placed in its own network namespace (below),
 #            so isolation here is about *filesystem* permissions, not networking.
@@ -70,29 +68,23 @@ id -u mediasvc &>/dev/null || useradd --system --create-home --shell /usr/sbin/n
 usermod -aG medianas qbtuser
 usermod -aG medianas mediasvc
 
-# ---------- 5. VPN NETWORK NAMESPACE (the actual killswitch) ------------------
-# Design: qBittorrent runs inside its own network namespace that contains
-# NOTHING but loopback and the WireGuard interface. There is no default route
-# to anywhere else - not because a firewall rule forbids it, but because no
-# such path physically exists in that namespace. If the tunnel goes down,
-# qBittorrent has zero interfaces left to send a single packet through.
+# ---------- VPN NETWORK NAMESPACE (the actual killswitch) ------------------
+# Design: qBittorrent runs inside its own network namespace that contains NOTHING but loopback and the WireGuard interface. 
+# There is no default route to anywhere else - not because a firewall rule forbids it, but because no such path physically exists in that namespace.
+# If the tunnel goes down, qBittorrent has zero interfaces left to send a single packet through.
 #
-# Management access (WebUI, Radarr/Sonarr talking to qBittorrent's API) goes
-# through a private point-to-point veth link between the host and the
-# namespace - this is NOT your LAN, it's an isolated /30 that only connects
-# the host to this one namespace. Only ONE narrow, explicit port-forward
-# (WebUI port 8080) bridges it to your LAN, so outside access is possible
+# Management access (WebUI, Radarr/Sonarr talking to qBittorrent's API) goes through a private point-to-point veth link between the host and the
+# namespace - this is NOT your LAN, it's an isolated /30 that only connects the host to this one namespace.
+# Only ONE narrow, explicit port-forward (WebUI port 8080) bridges it to your LAN, so outside access is possible
 # but auditable and minimal - very different from "allow the whole LAN out".
 echo "==> Setting up the isolated VPN network namespace..."
 
 cp "$WG_CONF_SRC" /etc/wireguard/wg0.conf
 chmod 600 /etc/wireguard/wg0.conf
 
-# Extract the provider's DNS server (works for ANY WireGuard provider, since
-# they all use the same standard "DNS = x.x.x.x" line) and force ALL DNS
-# lookups made inside the namespace through it. Since the namespace's only
-# route out is the tunnel, DNS queries fail closed if the VPN is down -
-# exactly what protects against leaking which sites/trackers you're resolving.
+# Extract the provider's DNS server (works for ANY WireGuard provider, since they all use the same standard "DNS = x.x.x.x" line) and force ALL DNS lookups made inside the namespace through it.
+# Since the namespace's only route out is the tunnel, DNS queries fail closed if the VPN is down -
+# exactly what protects against leaking which sites/trackers we're resolving.
 WG_DNS=$(grep -iE '^\s*DNS\s*=' /etc/wireguard/wg0.conf | head -n1 | awk -F'=' '{print $2}' | cut -d',' -f1 | tr -d ' \t')
 [[ -n "$WG_DNS" ]] || WG_DNS="9.9.9.9"
 mkdir -p /etc/netns/${NS_NAME}
@@ -153,7 +145,7 @@ EOF
 systemctl daemon-reload
 systemctl enable vpn-netns >/dev/null
 
-# ---------- 6. qBITTORRENT-NOX (runs entirely inside the namespace) -----------
+# ---------- qBITTORRENT-NOX (runs entirely inside the namespace) -----------
 echo "==> Configuring qBittorrent..."
 mkdir -p /home/qbtuser/.config/qBittorrent
 cat > /home/qbtuser/.config/qBittorrent/qBittorrent.conf <<EOF
@@ -189,7 +181,7 @@ EOF
 systemctl daemon-reload
 systemctl enable qbittorrent-nox >/dev/null
 
-# ---------- 7. THE *ARR STACK (self-contained .NET releases) ------------------
+# ---------- THE *ARR STACK (self-contained .NET releases) ------------------
 install_servarr() {
   local name="$1" branch="$2"
   local lower; lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
@@ -226,7 +218,7 @@ install_servarr Lidarr master
 install_servarr Readarr master
 install_servarr Whisparr nightly   # adult-content automation; branch differs from the others
 
-# ---------- 8. NODE.JS (shared by Seerr + Homarr) ------------------------------
+# ---------- NODE.JS (shared by Seerr + Homarr) ------------------------------
 echo "==> Installing Node.js 24..."
 if ! command -v node >/dev/null || [[ "$(node -v | grep -oE '^v[0-9]+' | tr -d v)" -lt 24 ]]; then
   curl -fsSL https://deb.nodesource.com/setup_24.x | bash - >/dev/null
@@ -234,7 +226,7 @@ if ! command -v node >/dev/null || [[ "$(node -v | grep -oE '^v[0-9]+' | tr -d v
 fi
 npm install -g pnpm@10.30.3 --silent
 
-# ---------- 9. SEERR (actively maintained successor to Jellyseerr) ------------
+# ---------- SEERR ------------
 echo "==> Installing Seerr..."
 mkdir -p /opt/seerr
 git clone --quiet https://github.com/seerr-team/seerr.git /opt/seerr 2>/dev/null || true
@@ -268,7 +260,7 @@ EOF
 systemctl daemon-reload
 systemctl enable --now seerr >/dev/null
 
-# ---------- 10. HOMARR DASHBOARD ------------------------------------------------
+# ---------- HOMARR DASHBOARD ------------------------------------------------
 echo "==> Installing Homarr..."
 mkdir -p /opt/homarr
 git clone --quiet https://github.com/homarr-labs/homarr.git /opt/homarr 2>/dev/null || true
@@ -319,7 +311,7 @@ done
 systemctl daemon-reload
 systemctl enable --now homarr-nextjs homarr-websocket homarr-tasks >/dev/null
 
-# ---------- 11. P2P SWITCH (webhook, strict on/off ordering) ------------------
+# ---------- P2P SWITCH (webhook, strict on/off ordering) ------------------
 echo "==> Setting up the P2P switch..."
 mkdir -p /opt/webhook
 WEBHOOK_TOKEN=$(openssl rand -hex 20)
@@ -372,7 +364,7 @@ EOF
 systemctl daemon-reload
 systemctl enable --now p2p-webhook >/dev/null
 
-# ---------- 12. START THE VPN + SUMMARY ----------------------------------------
+# ---------- START THE VPN + SUMMARY ----------------------------------------
 systemctl start vpn-netns
 sleep 2
 systemctl start qbittorrent-nox
@@ -383,19 +375,19 @@ cat <<SUMMARY
 ==================================================================
  Installation complete (100% native, no Docker).
 
- qBittorrent WebUI : http://${PI_IP}:8080   (from the Pi itself: http://${VETH_NS_IP}:8080)
- Prowlarr           : http://${PI_IP}:9696
- Radarr             : http://${PI_IP}:7878
- Sonarr             : http://${PI_IP}:8989
- Lidarr             : http://${PI_IP}:8686
- Readarr            : http://${PI_IP}:8787
- Whisparr           : http://${PI_IP}:6969
- Seerr              : http://${PI_IP}:5055
- Homarr             : http://${PI_IP}:3000
+ qBittorrent WebUI  : http://${Host_IP}:8080   (from the Pi itself: http://${VETH_NS_IP}:8080)
+ Prowlarr           : http://${Host_IP}:9696
+ Radarr             : http://${Host_IP}:7878
+ Sonarr             : http://${Host_IP}:8989
+ Lidarr             : http://${Host_IP}:8686
+ Readarr            : http://${Host_IP}:8787
+ Whisparr           : http://${Host_IP}:6969
+ Seerr              : http://${Host_IP}:5055
+ Homarr             : http://${Host_IP}:3000
 
  P2P switch:
-   ON : http://${PI_IP}:${WEBHOOK_PORT}/hooks/p2p-on?token=${WEBHOOK_TOKEN}
-   OFF: http://${PI_IP}:${WEBHOOK_PORT}/hooks/p2p-off?token=${WEBHOOK_TOKEN}
+   ON : http://${Host_IP}:${WEBHOOK_PORT}/hooks/p2p-on?token=${WEBHOOK_TOKEN}
+   OFF: http://${Host_IP}:${WEBHOOK_PORT}/hooks/p2p-off?token=${WEBHOOK_TOKEN}
  (token also saved in /opt/webhook/hooks.json)
 
  Killswitch test (do this before trusting the setup):
