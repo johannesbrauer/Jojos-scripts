@@ -93,6 +93,24 @@ echo "nameserver ${WG_DNS}" > /etc/netns/${NS_NAME}/resolv.conf
 # isn't namespace-aware and would otherwise fight with the override above.
 sed -i '/^\s*DNS\s*=/Id' /etc/wireguard/wg0.conf
 
+# Extract the provider's Endpoint. In a brand-new namespace there is NO route to
+# it yet, so wg-quick's initial handshake would be unroutable. We add a specific
+# host-route (in up.sh below) that lets ONLY the Endpoint IP reach the host; every
+# other packet still routes through the tunnel, so this stays leak-proof.
+WG_ENDPOINT=$(grep -iE '^\s*Endpoint\s*=' /etc/wireguard/wg0.conf | head -n1 | sed -E 's/^[[:space:]]*[Ee]ndpoint[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//')
+[[ -n "$WG_ENDPOINT" ]] || { echo "ERROR: No Endpoint line found in $WG_CONF_SRC."; exit 1; }
+WG_ENDPOINT_IP=${WG_ENDPOINT%:*}
+WG_ENDPOINT_IP=${WG_ENDPOINT_IP#[}
+WG_ENDPOINT_IP=${WG_ENDPOINT_IP%]}
+if [[ "$WG_ENDPOINT_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  :
+elif [[ "$WG_ENDPOINT_IP" =~ ^[0-9a-fA-F:]+$ ]]; then
+  echo "ERROR: IPv6 WireGuard Endpoints are not supported by this script ($WG_ENDPOINT_IP)." >&2; exit 1
+else
+  WG_ENDPOINT_IP=$(getent ahostsv4 "$WG_ENDPOINT_IP" | awk 'NR==1{print $1}' || true)
+  [[ -n "$WG_ENDPOINT_IP" ]] || { echo "ERROR: Cannot resolve Endpoint host '$WG_ENDPOINT'." >&2; exit 1; }
+fi
+
 mkdir -p /opt/vpn-netns
 cat > /opt/vpn-netns/up.sh <<EOF
 #!/usr/bin/env bash
@@ -107,20 +125,40 @@ ip link set veth-host up
 ip netns exec ${NS_NAME} ip addr add ${VETH_NS_IP}/30 dev veth-ns 2>/dev/null || true
 ip netns exec ${NS_NAME} ip link set veth-ns up
 
+# Host forwarding must be on BEFORE the handshake - the namespace reaches the
+# provider's Endpoint only by hopping through the host.
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+# Bootstrap host-route: ONLY the VPN Endpoint IP may leave the namespace via the
+# host (handshake packets). No default route through the host exists in this
+# namespace - that is exactly what keeps it leak-proof if the tunnel drops.
+ip netns exec ${NS_NAME} ip route add ${WG_ENDPOINT_IP}/32 via ${VETH_HOST_IP%/*} dev veth-ns
+
 # Bring the tunnel up INSIDE the namespace - this becomes its only route out.
 ip netns exec ${NS_NAME} wg-quick up wg0
 
-# One narrow port-forward so LAN devices can reach the WebUI at the Pi's
+# Route LAN return-traffic back through the host so the forwarded WebUI works
+# (without this, replies to LAN clients would exit via the tunnel instead of
+# coming back through the veth link).
+ip netns exec ${NS_NAME} ip route replace ${LAN_SUBNET} via ${VETH_HOST_IP%/*} dev veth-ns
+
+# One narrow port-forward so LAN devices can reach the WebUI at the machine's
 # normal IP. Restricted to your LAN subnet as the source, on purpose.
-sysctl -w net.ipv4.ip_forward=1 >/dev/null
 iptables -t nat -A PREROUTING -s ${LAN_SUBNET} -p tcp --dport 8080 -j DNAT --to-destination ${VETH_NS_IP}:8080
-iptables -A FORWARD -d ${VETH_NS_IP} -p tcp --dport 8080 -j ACCEPT
+# Everything forwarded INTO the namespace (WebUI forwards + WireGuard handshake replies).
+iptables -A FORWARD -o veth-host -d ${VETH_NS_IP} -j ACCEPT
+# Namespace -> LAN: only replies to established flows (the forwarded WebUI).
+iptables -A FORWARD -i veth-host -s ${VETH_NS_IP} -d ${LAN_SUBNET} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+# Explicitly block any NEW namespace -> LAN connections (belt and braces).
+iptables -A FORWARD -i veth-host -s ${VETH_NS_IP} -d ${LAN_SUBNET} -m conntrack --ctstate NEW -j DROP
 EOF
 
 cat > /opt/vpn-netns/down.sh <<EOF
 #!/usr/bin/env bash
 iptables -t nat -D PREROUTING -s ${LAN_SUBNET} -p tcp --dport 8080 -j DNAT --to-destination ${VETH_NS_IP}:8080 2>/dev/null || true
-iptables -D FORWARD -d ${VETH_NS_IP} -p tcp --dport 8080 -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -o veth-host -d ${VETH_NS_IP} -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i veth-host -s ${VETH_NS_IP} -d ${LAN_SUBNET} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i veth-host -s ${VETH_NS_IP} -d ${LAN_SUBNET} -m conntrack --ctstate NEW -j DROP 2>/dev/null || true
 ip netns exec ${NS_NAME} wg-quick down wg0 2>/dev/null || true
 ip link del veth-host 2>/dev/null || true
 ip netns del ${NS_NAME} 2>/dev/null || true
@@ -364,10 +402,146 @@ EOF
 systemctl daemon-reload
 systemctl enable --now p2p-webhook >/dev/null
 
+# ---------- VPN EGRESS STATUS PAGE (Homarr widget) --------------------------
+# Serves a tiny self-refreshing page + status.json showing the qBittorrent
+# namespace's current egress IP / city / country (with Mullvad exit confirmation
+# when the tunnel egresses Mullvad). In Homarr add it as an "Embed" widget.
+echo "==> Setting up VPN status page (for Homarr)..."
+mkdir -p /opt/vpn-netns/www
+
+cat > /opt/vpn-netns/status.sh <<EOF
+#!/usr/bin/env bash
+set -e
+ip netns exec ${NS_NAME} curl -fsSL --max-time 10 https://am.i.mullvad.net/json \\
+  -o /tmp/vpn-status.json 2>/dev/null || echo '{}' > /tmp/vpn-status.json
+[ -s /tmp/vpn-status.json ] || echo '{}' > /tmp/vpn-status.json
+mv -f /tmp/vpn-status.json /opt/vpn-netns/www/status.json
+EOF
+chmod +x /opt/vpn-netns/status.sh
+
+cat > /opt/vpn-netns/www/index.html <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VPN egress</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#111;color:#eee;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}
+  .card{background:#1c1c1e;border:1px solid #333;border-radius:10px;padding:24px 32px;min-width:280px}
+  h1{font-size:16px;margin:0 0 14px;color:#9aa}
+  .row{display:flex;justify-content:space-between;gap:24px;padding:6px 0;border-bottom:1px solid #2a2a2c}
+  .row:last-child{border:none}
+  .k{color:#777}.v{font-weight:600}
+  .ok{color:#4ade80}.bad{color:#f87171}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>VPN egress (qBittorrent)</h1>
+  <div class="row"><span class="k">IP</span><span class="v" id="ip">-</span></div>
+  <div class="row"><span class="k">City</span><span class="v" id="city">-</span></div>
+  <div class="row"><span class="k">Country</span><span class="v" id="country">-</span></div>
+  <div class="row"><span class="k">Provider</span><span class="v" id="org">-</span></div>
+  <div class="row"><span class="k">Mullvad exit</span><span class="v" id="mullvad">-</span></div>
+</div>
+<script>
+async function refresh(){
+  try{
+    const r=await fetch('status.json',{cache:'no-store'});
+    const d=await r.json();
+    document.getElementById('ip').textContent=d.ip||'unreachable';
+    document.getElementById('city').textContent=d.city||'-';
+    document.getElementById('country').textContent=d.country||'-';
+    document.getElementById('org').textContent=d.organization||'-';
+    const ok=d.mullvad_exit_ip===true;
+    const m=document.getElementById('mullvad');
+    m.textContent=ok?'YES':'no';
+    m.className='v '+(ok?'ok':'bad');
+  }catch(e){ document.getElementById('ip').textContent='no data'; }
+}
+refresh();
+setInterval(refresh,30000);
+</script>
+</body>
+</html>
+EOF
+
+cat > /etc/systemd/system/vpn-status.service <<EOF
+[Unit]
+Description=Refresh VPN egress status.json (Homarr widget)
+After=vpn-netns.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/vpn-netns/status.sh
+EOF
+
+cat > /etc/systemd/system/vpn-status.timer <<EOF
+[Unit]
+Description=Refresh VPN egress status every 2 minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=2min
+Unit=vpn-status.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+cat > /etc/systemd/system/vpn-status-web.service <<EOF
+[Unit]
+Description=Serves the VPN egress page for the Homarr embed widget
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$(command -v python3) -m http.server 8855 --bind 0.0.0.0 --directory /opt/vpn-netns/www
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now vpn-status.timer vpn-status-web >/dev/null
+/opt/vpn-netns/status.sh
+
 # ---------- START THE VPN + SUMMARY ----------------------------------------
 systemctl start vpn-netns
 sleep 2
 systemctl start qbittorrent-nox
+
+# ---------- POST-INSTALL LEAK CHECK (plus Mullvad egress info) -------------
+echo "==> Verifying VPN egress (kill-switch check)..."
+for _ in $(seq 1 15); do
+  ip netns exec ${NS_NAME} wg show wg0 latest-handshakes 2>/dev/null | grep -qv $'\t0' && break
+  sleep 1
+done
+
+# am.i.mullvad.net/json reports IP + city + country for ANY VPN provider, and
+# confirms the Mullvad exit-IP + server when the tunnel actually egresses Mullvad.
+HOST_WAN=$(curl -fsSL --max-time 15 https://am.i.mullvad.net/json 2>/dev/null | jq -c '{ip: .ip, city: .city, country: .country, mullvad: (.mullvad_exit_ip == true)}' || true)
+NS_WAN=$(ip netns exec ${NS_NAME} curl -fsSL --max-time 15 https://am.i.mullvad.net/json 2>/dev/null | jq -c '{ip: .ip, city: .city, country: .country, mullvad: (.mullvad_exit_ip == true), server: .server_hostname}' || true)
+
+NS_IP=$(jq -r '.ip // "unreachable"' <<<"${NS_WAN:-{\"ip\":null}}" 2>/dev/null || echo "unreachable")
+HOST_IP_WAN=$(jq -r '.ip // "unreachable"' <<<"${HOST_WAN:-{\"ip\":null}}" 2>/dev/null || echo "unreachable")
+
+if [[ -n "$NS_IP" && "$NS_IP" != "unreachable" && "$NS_IP" != "$HOST_IP_WAN" ]]; then
+  echo "OK: No IP leak. Namespace egress IP = ${NS_IP} (host = ${HOST_IP_WAN})."
+  echo "    VPN location : $(jq -r '"\(.city), \(.country)"' <<<"${NS_WAN}" 2>/dev/null)"
+  if jq -e '.mullvad' <<<"${NS_WAN}" >/dev/null 2>&1; then
+    echo "    Mullvad     : confirmed exit IP ${NS_IP} - server $(jq -r '.server // "unknown"' <<<"${NS_WAN}")"
+  else
+    echo "    Mullvad     : not detected (fine if your provider is not Mullvad)."
+  fi
+else
+  echo "!!! LEAK-CHECK FAILED: namespace egress = ${NS_IP}, host egress = ${HOST_IP_WAN}." >&2
+  echo "!!! Do NOT trust this setup until the VPN tunnel is confirmed working." >&2
+  exit 1
+fi
 
 PI_IP=$(hostname -I | awk '{print $1}')
 cat <<SUMMARY
@@ -375,20 +549,23 @@ cat <<SUMMARY
 ==================================================================
  Installation complete (100% native, no Docker).
 
- qBittorrent WebUI  : http://${Host_IP}:8080   (from the Pi itself: http://${VETH_NS_IP}:8080)
- Prowlarr           : http://${Host_IP}:9696
- Radarr             : http://${Host_IP}:7878
- Sonarr             : http://${Host_IP}:8989
- Lidarr             : http://${Host_IP}:8686
- Readarr            : http://${Host_IP}:8787
- Whisparr           : http://${Host_IP}:6969
- Seerr              : http://${Host_IP}:5055
- Homarr             : http://${Host_IP}:3000
+ qBittorrent WebUI  : http://${PI_IP}:8080   (from the Pi itself: http://${VETH_NS_IP}:8080)
+ Prowlarr           : http://${PI_IP}:9696
+ Radarr             : http://${PI_IP}:7878
+ Sonarr             : http://${PI_IP}:8989
+ Lidarr             : http://${PI_IP}:8686
+ Readarr            : http://${PI_IP}:8787
+ Whisparr           : http://${PI_IP}:6969
+ Seerr              : http://${PI_IP}:5055
+ Homarr             : http://${PI_IP}:3000
 
  P2P switch:
-   ON : http://${Host_IP}:${WEBHOOK_PORT}/hooks/p2p-on?token=${WEBHOOK_TOKEN}
-   OFF: http://${Host_IP}:${WEBHOOK_PORT}/hooks/p2p-off?token=${WEBHOOK_TOKEN}
+   ON : http://${PI_IP}:${WEBHOOK_PORT}/hooks/p2p-on?token=${WEBHOOK_TOKEN}
+   OFF: http://${PI_IP}:${WEBHOOK_PORT}/hooks/p2p-off?token=${WEBHOOK_TOKEN}
  (token also saved in /opt/webhook/hooks.json)
+
+ VPN status widget (in Homarr: add an "Embed" widget with this URL):
+   URL: http://${PI_IP}:8855        (raw JSON: http://${PI_IP}:8855/status.json)
 
  Killswitch test (do this before trusting the setup):
    sudo systemctl stop vpn-netns
