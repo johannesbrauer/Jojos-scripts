@@ -17,9 +17,9 @@ export NEEDRESTART_SUSPEND=1
 export DEBIAN_FRONTEND=noninteractive
 
 # ---------- CONFIGURATION (edit these) -------------------------------------
-NAS_PATH="/mnt/nas/media"          # Existing NAS mount, ONE shared area
-WG_CONF_SRC="/root/vpn.conf"       # Any standard WireGuard .conf from ANY provider
-LAN_SUBNET="192.168.0.0/24"        # Your home network, adjust if different
+NAS_PATH="/mnt/nas_NFS_Filme_share"          # Existing NAS mount, ONE shared area
+WG_CONF_SRC="/root/nl-ams-wg-302.conf"       # Any standard WireGuard .conf from ANY provider
+LAN_SUBNET="192.168.178.0/24"        # Your home network, adjust if different
 WEBHOOK_PORT=9000
 STATUS_PORT=8855                  # VPN egress status page (Homarr "Embed" widget)
 
@@ -46,7 +46,9 @@ esac
 echo "==> Installing base packages..."
 apt-get update -qq
 apt-get install -y wireguard-tools iproute2 iptables curl git jq openssl \
-  ca-certificates build-essential python3 make g++ qbittorrent-nox >/dev/null
+  ca-certificates build-essential python3 make g++ qbittorrent-nox redis-server >/dev/null
+# Homarr connects to its local Redis at localhost:6379 by default.
+systemctl enable --now redis-server >/dev/null
 
 # ---------- NAS FOLDER STRUCTURE + SHARED GROUP ----------------------------
 echo "==> Creating NAS folder structure..."
@@ -303,6 +305,10 @@ systemctl enable qbittorrent-nox >/dev/null
 install_servarr() {
   local name="$1" branch="$2"
   local lower; lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+  if [ -x "/opt/${name}/${name}" ]; then
+    echo "==> ${name} already installed, skipping."
+    return
+  fi
   echo "==> Installing ${name}..."
   local url
   if [[ "$name" == "Sonarr" ]]; then
@@ -355,18 +361,25 @@ npm install -g --prefix /opt/pnpm10 pnpm@10.24.0 --silent
 echo "==> Installing Seerr..."
 mkdir -p /opt/seerr
 [ -n "$(ls -A /opt/seerr 2>/dev/null)" ] || git clone --quiet https://github.com/seerr-team/seerr.git /opt/seerr
-cd /opt/seerr && git checkout --quiet main
-# Seerr pins Node ^22.19 (incompatible with the global Node 24 that Homarr needs),
-# so embed a private Node 22 under /opt/seerr-node and build with it + pnpm 10.
-mkdir -p /opt/seerr-node
-if [ ! -x /opt/seerr-node/bin/node ]; then
-  curl -fsSL https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-arm64.tar.xz \
-    | tar -xJ -C /opt/seerr-node --strip-components=1
+cd /opt/seerr && git -c safe.directory=/opt/seerr checkout --quiet main
+if [ ! -f /opt/seerr/dist/index.js ]; then
+  # Seerr pins Node ^22.19 (incompatible with the global Node 24 that Homarr needs),
+  # so embed a private Node 22 under /opt/seerr-node and build with it + pnpm 10.
+  # The PATH override is scoped to a subshell so the global Node 24 stays active after.
+  mkdir -p /opt/seerr-node
+  if [ ! -x /opt/seerr-node/bin/node ]; then
+    curl -fsSL https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-arm64.tar.xz \
+      | tar -xJ -C /opt/seerr-node --strip-components=1
+  fi
+  (
+    export PATH="/opt/pnpm10/bin:/opt/seerr-node/bin:$PATH"
+    CYPRESS_INSTALL_BINARY=0 pnpm install --frozen-lockfile
+    pnpm build
+  )
+  chown -R mediasvc:medianas /opt/seerr
+else
+  echo "==> Seerr already built, skipping."
 fi
-export PATH="/opt/pnpm10/bin:/opt/seerr-node/bin:$PATH"
-CYPRESS_INSTALL_BINARY=0 pnpm install --frozen-lockfile
-pnpm build
-chown -R mediasvc:medianas /opt/seerr
 
 mkdir -p /etc/seerr
 echo "PORT=5055" > /etc/seerr/seerr.conf
@@ -394,53 +407,108 @@ systemctl daemon-reload
 systemctl enable --now seerr >/dev/null
 
 # ---------- HOMARR DASHBOARD ------------------------------------------------
-echo "==> Installing Homarr..."
-mkdir -p /opt/homarr
-[ -n "$(ls -A /opt/homarr 2>/dev/null)" ] || git clone --quiet https://github.com/homarr-labs/homarr.git /opt/homarr
-cd /opt/homarr && git checkout --quiet "$(git tag --sort=v:refname | tail -n1)"
-pnpm install --frozen-lockfile
+if [ ! -f /opt/homarr/apps/nextjs/.next/BUILD_ID ]; then
+  echo "==> Building Homarr (first run)..."
+  mkdir -p /opt/homarr
+  [ -n "$(ls -A /opt/homarr 2>/dev/null)" ] || git clone --quiet https://github.com/homarr-labs/homarr.git /opt/homarr
+  cd /opt/homarr && git -c safe.directory=/opt/homarr checkout --quiet "$(git tag --sort=v:refname | tail -n1)"
+  pnpm install --frozen-lockfile
+  pnpm build
+  pnpm db:migration:sqlite:run
+else
+  echo "==> Homarr already built, skipping install/build."
+fi
 
+# --- config part (always runs, idempotent) ----------------------------------
 mkdir -p /opt/homarr-data/{db,redis,trusted-certificates}
-SECRET_KEY=$(openssl rand -hex 32)
-cat > /opt/homarr/.env <<EOF
+if [ ! -f /opt/homarr/.env ]; then
+  SECRET_KEY=$(openssl rand -hex 32)
+  AUTH_SECRET=$(openssl rand -base64 32)
+  cat > /opt/homarr/.env <<EOF
 SECRET_ENCRYPTION_KEY=${SECRET_KEY}
+AUTH_SECRET=${AUTH_SECRET}
 DB_DRIVER=better-sqlite3
 DB_URL=/opt/homarr-data/db/db.sqlite
 LOG_LEVEL=info
 AUTH_PROVIDERS=credentials
 TURBO_TELEMETRY_DISABLED=1
 EOF
+else
+  grep -q '^AUTH_SECRET=' /opt/homarr/.env || echo "AUTH_SECRET=$(openssl rand -base64 32)" >> /opt/homarr/.env
+fi
 
-pnpm build
-pnpm db:migration:sqlite:run
-chown -R mediasvc:medianas /opt/homarr /opt/homarr-data
+# Resolve the real Homarr runtimes (pnpm-workspace bins) for the systemd units:
+# nextjs = "next start" (port 3000), websocket/tasks = tsx <src>/main.ts.
+HOMARR_NEXT_BIN=$(find /opt/homarr -maxdepth 6 -type l -path '*/.bin/next' 2>/dev/null | head -n1)
+[ -n "$HOMARR_NEXT_BIN" ] || HOMARR_NEXT_BIN=$(cd /opt/homarr/apps/nextjs && pnpm exec which next 2>/dev/null || true)
+HOMARR_TSX_BIN=$(find /opt/homarr -maxdepth 6 -type l -path '*/.bin/tsx' 2>/dev/null | head -n1)
+[ -n "$HOMARR_TSX_BIN" ] || HOMARR_TSX_BIN=$(cd /opt/homarr/apps/websocket && pnpm exec which tsx 2>/dev/null || true)
+if [ -z "$HOMARR_NEXT_BIN" ] || [ -z "$HOMARR_TSX_BIN" ]; then
+  echo "ERROR: Could not locate the Homarr 'next'/'tsx' binaries under /opt/homarr" >&2
+  exit 1
+fi
 
-for svc in nextjs websocket tasks; do
-  case "$svc" in
-    nextjs)    exec_path="/opt/homarr/apps/nextjs/server.js" ;;
-    websocket) exec_path="/opt/homarr/apps/websocket/wssServer.cjs" ;;
-    tasks)     exec_path="/opt/homarr/apps/tasks/tasks.cjs" ;;
-  esac
-  cat > "/etc/systemd/system/homarr-${svc}.service" <<EOF
+cat > /etc/systemd/system/homarr-nextjs.service <<EOF
 [Unit]
-Description=Homarr ${svc}
+Description=Homarr nextjs
 After=network.target
 
 [Service]
 Type=simple
 User=mediasvc
 Group=medianas
-WorkingDirectory=$(dirname "$exec_path")
+WorkingDirectory=/opt/homarr/apps/nextjs
 Environment=NODE_ENV=production
 EnvironmentFile=/opt/homarr/.env
-ExecStart=$(command -v node) ${exec_path}
+ExecStart=${HOMARR_NEXT_BIN} start -p 3000
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 EOF
-done
+
+cat > /etc/systemd/system/homarr-websocket.service <<EOF
+[Unit]
+Description=Homarr websocket
+After=network.target
+
+[Service]
+Type=simple
+User=mediasvc
+Group=medianas
+WorkingDirectory=/opt/homarr
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/homarr/.env
+ExecStart=${HOMARR_TSX_BIN} /opt/homarr/apps/websocket/src/main.ts
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/homarr-tasks.service <<EOF
+[Unit]
+Description=Homarr tasks
+After=network.target
+
+[Service]
+Type=simple
+User=mediasvc
+Group=medianas
+WorkingDirectory=/opt/homarr
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/homarr/.env
+ExecStart=${HOMARR_TSX_BIN} /opt/homarr/apps/tasks/src/main.ts
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+chown -R mediasvc:medianas /opt/homarr /opt/homarr-data
 systemctl daemon-reload
 systemctl enable --now homarr-nextjs homarr-websocket homarr-tasks >/dev/null
 
@@ -516,6 +584,7 @@ set -e
 ip netns exec ${NS_NAME} curl -fsSL --max-time 10 https://am.i.mullvad.net/json \\
   -o /tmp/vpn-status.json 2>/dev/null || echo '{}' > /tmp/vpn-status.json
 [ -s /tmp/vpn-status.json ] || echo '{}' > /tmp/vpn-status.json
+rm -rf /opt/vpn-netns/www/status.json
 mv -f /tmp/vpn-status.json /opt/vpn-netns/www/status.json
 EOF
 chmod +x /opt/vpn-netns/status.sh
