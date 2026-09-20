@@ -17,9 +17,9 @@ export NEEDRESTART_SUSPEND=1
 export DEBIAN_FRONTEND=noninteractive
 
 # ---------- CONFIGURATION (edit these) -------------------------------------
-NAS_PATH="/mnt/nas_NFS_Filme_share"          # Existing NAS mount, ONE shared area
-WG_CONF_SRC="/root/nl-ams-wg-302.conf"       # Any standard WireGuard .conf from ANY provider
-LAN_SUBNET="192.168.178.0/24"        # Your home network, adjust if different
+NAS_PATH="/mnt/nas/media"          # Existing NAS mount, ONE shared area
+WG_CONF_SRC="/root/vpn.conf"       # Any standard WireGuard .conf from ANY provider
+LAN_SUBNET="192.168.0.0/24"        # Your home network, adjust if different
 WEBHOOK_PORT=9000
 STATUS_PORT=8855                  # VPN egress status page (Homarr "Embed" widget)
 
@@ -98,6 +98,10 @@ echo "==> Setting up the isolated VPN network namespace..."
 
 cp "$WG_CONF_SRC" /etc/wireguard/wg0.conf
 chmod 600 /etc/wireguard/wg0.conf
+# Normalize provider confs: strip CRLF and repair any PersistentKeepalive line that
+# an earlier append glued onto the previous line (source conf without trailing newline).
+sed -i 's/\r$//' /etc/wireguard/wg0.conf
+sed -i -E 's/([0-9])[[:space:]]*([Pp]ersistentKeepalive[[:space:]]*=)/\1\n\2/' /etc/wireguard/wg0.conf
 
 # Extract the provider's DNS server (works for ANY WireGuard provider, since they all use the same standard "DNS = x.x.x.x" line) and force ALL DNS lookups made inside the namespace through it.
 # Since the namespace's only route out is the tunnel, DNS queries fail closed if the VPN is down -
@@ -141,7 +145,7 @@ fi
 # 30-180 s idle and the tunnel needs a new handshake round (sporadic stalls).
 # Any existing value (incl. an explicit 0) is respected and not overridden.
 if ! grep -qiE '^\s*PersistentKeepalive\s*=' /etc/wireguard/wg0.conf; then
-  echo "PersistentKeepalive = 25" >> /etc/wireguard/wg0.conf
+  printf '\nPersistentKeepalive = 25\n' >> /etc/wireguard/wg0.conf
   echo "NOTE: 'PersistentKeepalive = 25' added to wg0.conf (needed because the carrier is NAT'ed)."
 fi
 
