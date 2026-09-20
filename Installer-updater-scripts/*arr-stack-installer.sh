@@ -9,6 +9,12 @@
 #         + a tiny webhook for a safe P2P on/off switch
 # ==============================================================================
 set -euo pipefail
+trap 'rc=$?; echo "ERROR: installer aborted at line ${LINENO} (exit ${rc})" >&2' ERR
+
+# Headless install: skip the needrestart hook (known to hang on non-standard
+# ARM /boot layouts) and never let debconf block on an interactive prompt.
+export NEEDRESTART_SUSPEND=1
+export DEBIAN_FRONTEND=noninteractive
 
 # ---------- CONFIGURATION (edit these) -------------------------------------
 NAS_PATH="/mnt/nas/media"          # Existing NAS mount, ONE shared area
@@ -340,14 +346,25 @@ if ! command -v node >/dev/null || [[ "$(node -v | grep -oE '^v[0-9]+' | tr -d v
   curl -fsSL https://deb.nodesource.com/setup_24.x | bash - >/dev/null
   apt-get install -y nodejs >/dev/null
 fi
-npm install -g pnpm@10.30.3 --silent
+npm install -g pnpm@11.15.1 --silent
+# Seerr pins Node ^22 and pnpm ^10; keep a private pnpm 10 (isolated --prefix) and
+# an embedded Node 22 below. The global pnpm 11 stays for the Node-24-based stack.
+npm install -g --prefix /opt/pnpm10 pnpm@10.24.0 --silent
 
 # ---------- SEERR ------------
 echo "==> Installing Seerr..."
 mkdir -p /opt/seerr
-git clone --quiet https://github.com/seerr-team/seerr.git /opt/seerr 2>/dev/null || true
+[ -n "$(ls -A /opt/seerr 2>/dev/null)" ] || git clone --quiet https://github.com/seerr-team/seerr.git /opt/seerr
 cd /opt/seerr && git checkout --quiet main
-CYPRESS_INSTALL_BINARY=0 pnpm install --frozen-lockfile --silent
+# Seerr pins Node ^22.19 (incompatible with the global Node 24 that Homarr needs),
+# so embed a private Node 22 under /opt/seerr-node and build with it + pnpm 10.
+mkdir -p /opt/seerr-node
+if [ ! -x /opt/seerr-node/bin/node ]; then
+  curl -fsSL https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-arm64.tar.xz \
+    | tar -xJ -C /opt/seerr-node --strip-components=1
+fi
+export PATH="/opt/pnpm10/bin:/opt/seerr-node/bin:$PATH"
+CYPRESS_INSTALL_BINARY=0 pnpm install --frozen-lockfile
 pnpm build
 chown -R mediasvc:medianas /opt/seerr
 
@@ -368,7 +385,7 @@ Environment=NODE_ENV=production
 Type=exec
 Restart=on-failure
 WorkingDirectory=/opt/seerr
-ExecStart=$(command -v node) dist/index.js
+ExecStart=/opt/seerr-node/bin/node dist/index.js
 
 [Install]
 WantedBy=multi-user.target
@@ -379,9 +396,9 @@ systemctl enable --now seerr >/dev/null
 # ---------- HOMARR DASHBOARD ------------------------------------------------
 echo "==> Installing Homarr..."
 mkdir -p /opt/homarr
-git clone --quiet https://github.com/homarr-labs/homarr.git /opt/homarr 2>/dev/null || true
+[ -n "$(ls -A /opt/homarr 2>/dev/null)" ] || git clone --quiet https://github.com/homarr-labs/homarr.git /opt/homarr
 cd /opt/homarr && git checkout --quiet "$(git tag --sort=v:refname | tail -n1)"
-pnpm install --frozen-lockfile --silent
+pnpm install --frozen-lockfile
 
 mkdir -p /opt/homarr-data/{db,redis,trusted-certificates}
 SECRET_KEY=$(openssl rand -hex 32)
