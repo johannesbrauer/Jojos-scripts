@@ -4,7 +4,7 @@
 #  Assumes: Jellyfin already installed, NAS already mounted.
 #
 #  Stack: any WireGuard VPN + qBittorrent-nox (network-namespace isolated)
-#         + Prowlarr + Radarr + Sonarr + Lidarr + Readarr + Whisparr
+#         + Prowlarr + Radarr + Sonarr + Lidarr + Whisparr
 #         + Seerr (Jellyseerr's actively maintained successor) + Homarr
 #         + a tiny webhook for a safe P2P on/off switch
 # ==============================================================================
@@ -68,7 +68,7 @@ chmod -R 2775 "$NAS_PATH"
 #            This user's process is placed in its own network namespace (below),
 #            so isolation here is about *filesystem* permissions, not networking.
 # mediasvc : ONE shared, unprivileged, no-login account for every other service
-#            (Prowlarr/Radarr/Sonarr/Lidarr/Readarr/Whisparr/Seerr/Homarr).
+#            (Prowlarr/Radarr/Sonarr/Lidarr/Whisparr/Seerr/Homarr).
 #            These services don't need to be isolated from each other - only
 #            qBittorrent's P2P traffic does - so one shared account keeps user
 #            management simple instead of creating six near-identical accounts.
@@ -298,8 +298,13 @@ install_servarr() {
   local name="$1" branch="$2"
   local lower; lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
   echo "==> Installing ${name}..."
-  curl -fsSL -o "/tmp/${name}.tar.gz" \
-    "https://${lower}.servarr.com/v1/update/${branch}/updatefile?os=linux&runtime=netcore&arch=${SERVARR_ARCH}"
+  local url
+  if [[ "$name" == "Sonarr" ]]; then
+    url="https://services.sonarr.tv/v1/download/main/latest?version=4&os=linux&arch=${SERVARR_ARCH}"
+  else
+    url="https://${lower}.servarr.com/v1/update/${branch}/updatefile?os=linux&runtime=netcore&arch=${SERVARR_ARCH}"
+  fi
+  curl -fsSL -o "/tmp/${name}.tar.gz" "$url"
   tar -xzf "/tmp/${name}.tar.gz" -C /opt
   mkdir -p "/opt/${name}-data"
   chown -R mediasvc:medianas "/opt/${name}" "/opt/${name}-data"
@@ -327,7 +332,6 @@ install_servarr Prowlarr master
 install_servarr Radarr master
 install_servarr Sonarr master
 install_servarr Lidarr master
-install_servarr Readarr master
 install_servarr Whisparr nightly   # adult-content automation; branch differs from the others
 
 # ---------- NODE.JS (shared by Seerr + Homarr) ------------------------------
@@ -635,7 +639,6 @@ cat <<SUMMARY
  Radarr             : http://${PI_IP}:7878
  Sonarr             : http://${PI_IP}:8989
  Lidarr             : http://${PI_IP}:8686
- Readarr            : http://${PI_IP}:8787
  Whisparr           : http://${PI_IP}:6969
  Seerr              : http://${PI_IP}:5055
  Homarr             : http://${PI_IP}:3000
