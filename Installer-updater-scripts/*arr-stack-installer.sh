@@ -128,6 +128,15 @@ if ! grep -qiE '^\s*AllowedIPs\s*=\s*(0\.0\.0\.0/0|0\.0\.0\.0/1,?\s*128\.0\.0\.0
   echo "         The namespace will have no default route - qBittorrent will have no internet access." >&2
 fi
 
+# The tunnel carrier is NAT'ed through the host (MASQUERADE), so its conntrack entry
+# needs regular traffic to stay alive - host UDP NAT mappings otherwise expire after
+# 30-180 s idle and the tunnel needs a new handshake round (sporadic stalls).
+# Any existing value (incl. an explicit 0) is respected and not overridden.
+if ! grep -qiE '^\s*PersistentKeepalive\s*=' /etc/wireguard/wg0.conf; then
+  echo "PersistentKeepalive = 25" >> /etc/wireguard/wg0.conf
+  echo "NOTE: 'PersistentKeepalive = 25' added to wg0.conf (needed because the carrier is NAT'ed)."
+fi
+
 mkdir -p /opt/vpn-netns
 cat > /opt/vpn-netns/up.sh <<EOF
 #!/usr/bin/env bash
