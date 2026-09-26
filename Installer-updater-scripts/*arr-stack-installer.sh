@@ -433,12 +433,14 @@ SECRET_ENCRYPTION_KEY=${SECRET_KEY}
 AUTH_SECRET=${AUTH_SECRET}
 DB_DRIVER=better-sqlite3
 DB_URL=/opt/homarr-data/db/db.sqlite
+LOCAL_CERTIFICATE_PATH=/opt/homarr-data/trusted-certificates
 LOG_LEVEL=info
 AUTH_PROVIDERS=credentials
 TURBO_TELEMETRY_DISABLED=1
 EOF
 else
   grep -q '^AUTH_SECRET=' /opt/homarr/.env || echo "AUTH_SECRET=$(openssl rand -base64 32)" >> /opt/homarr/.env
+  grep -q '^LOCAL_CERTIFICATE_PATH=' /opt/homarr/.env || echo "LOCAL_CERTIFICATE_PATH=/opt/homarr-data/trusted-certificates" >> /opt/homarr/.env
 fi
 
 # Resolve the real Homarr runtimes (pnpm-workspace bins) for the systemd units:
