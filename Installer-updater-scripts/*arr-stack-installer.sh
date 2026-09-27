@@ -29,8 +29,118 @@ NS_NAME="vpnns"
 VETH_HOST_IP="10.200.200.1/30"
 VETH_NS_IP="10.200.200.2"
 
+# ---------- FUNCTIONS ---------------------------------------------------------
+apply_wg_conf() {
+  # Copies + normalizes ANY provider WireGuard conf into /etc/wireguard/wg0.conf:
+  # CRLF-strip, glued-PersistentKeepalive repair, DNS->resolv.conf, Endpoint
+  # validation, full-tunnel warning, keepalive append. Used by the main installer
+  # AND by the --change-vpn profile switch.
+  local src="$1"
+  [[ -f "$src" ]] || { echo "ERROR: WireGuard config not found at $src." >&2; exit 1; }
+  cp "$src" /etc/wireguard/wg0.conf
+  chmod 600 /etc/wireguard/wg0.conf
+  # Normalize provider confs: strip CRLF and repair any PersistentKeepalive line that
+  # an earlier append glued onto the previous line (source conf without trailing newline).
+  sed -i 's/\r$//' /etc/wireguard/wg0.conf
+  sed -i -E 's/([0-9])[[:space:]]*([Pp]ersistentKeepalive[[:space:]]*=)/\1\n\2/' /etc/wireguard/wg0.conf
+
+  # Force ALL DNS lookups made inside the namespace through the provider's DNS server
+  # (works for ANY WireGuard provider, since they all use the standard "DNS = x.x.x.x"
+  # line) - queries fail closed if the VPN is down, so no DNS leaks.
+  local wg_dns
+  wg_dns=$(grep -iE '^\s*DNS\s*=' /etc/wireguard/wg0.conf | head -n1 | awk -F'=' '{print $2}' | cut -d',' -f1 | tr -d ' \t')
+  [[ -n "$wg_dns" ]] || wg_dns="9.9.9.9"
+  mkdir -p /etc/netns/${NS_NAME}
+  echo "nameserver ${wg_dns}" > /etc/netns/${NS_NAME}/resolv.conf
+  # Remove the DNS line from wg0.conf itself - wg-quick's own resolvconf hook
+  # isn't namespace-aware and would otherwise fight with the override above.
+  sed -i '/^\s*DNS\s*=/Id' /etc/wireguard/wg0.conf
+
+  # Validate the provider's Endpoint (bootstrap host-route in up.sh needs it later).
+  local endpoint endpoint_ip
+  endpoint=$(grep -iE '^\s*Endpoint\s*=' /etc/wireguard/wg0.conf | head -n1 | sed -E 's/^[[:space:]]*[Ee]ndpoint[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//')
+  [[ -n "$endpoint" ]] || { echo "ERROR: No Endpoint line found in $src."; exit 1; }
+  endpoint_ip=${endpoint%:*}
+  endpoint_ip=${endpoint_ip#[}
+  endpoint_ip=${endpoint_ip%]}
+  if [[ "$endpoint_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    :
+  elif [[ "$endpoint_ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+    echo "ERROR: IPv6 WireGuard Endpoints are not supported by this script ($endpoint_ip)." >&2; exit 1
+  else
+    endpoint_ip=$(getent ahostsv4 "$endpoint_ip" | awk 'NR==1{print $1}' || true)
+    [[ -n "$endpoint_ip" ]] || { echo "ERROR: Cannot resolve Endpoint host '$endpoint'." >&2; exit 1; }
+  fi
+
+  # Full-tunnel check: wg-quick only adds a default route when AllowedIPs covers 0.0.0.0/0
+  # (either literally or as the 0.0.0.0/1 + 128.0.0.0/1 pair). Without it the namespace
+  # gets no default route at all -> qBittorrent has no internet (fail-closed, no leak).
+  if ! grep -qiE '^\s*AllowedIPs\s*=\s*(0\.0\.0\.0/0|0\.0\.0\.0/1,?\s*128\.0\.0\.0/1)' /etc/wireguard/wg0.conf; then
+    echo "WARNING: wg0.conf does not look like a full-tunnel config (AllowedIPs is not 0.0.0.0/0)." >&2
+    echo "         The namespace will have no default route - qBittorrent will have no internet access." >&2
+  fi
+
+  # The tunnel carrier is NAT'ed through the host (MASQUERADE), so its conntrack entry
+  # needs regular traffic to stay alive - host UDP NAT mappings otherwise expire after
+  # 30-180 s idle and the tunnel needs a new handshake round (sporadic stalls).
+  # Any existing value (incl. an explicit 0) is respected and not overridden.
+  if ! grep -qiE '^\s*PersistentKeepalive\s*=' /etc/wireguard/wg0.conf; then
+    printf '\nPersistentKeepalive = 25\n' >> /etc/wireguard/wg0.conf
+    echo "NOTE: 'PersistentKeepalive = 25' added to wg0.conf (needed because the carrier is NAT'ed)."
+  fi
+}
+
+change_vpn() {
+  # One-shot VPN profile switch: --change-vpn. Only touches the VPN/qBittorrent
+  # block - everything else stays untouched. Leak-proof stop order, self-healing.
+  systemctl list-unit-files vpn-netns.service >/dev/null 2>&1 || {
+    echo "ERROR: VPN stack is not installed yet - run the full installer first." >&2
+    exit 1
+  }
+
+  local new_conf
+  echo "==> VPN profile change (current: ${WG_CONF_SRC})"
+  read -re -i "$WG_CONF_SRC" -p "Pfad zur neuen WireGuard-Konfiguration (Enter = aktuell): " new_conf || true
+  new_conf="${new_conf:-$WG_CONF_SRC}"
+  [[ -f "$new_conf" ]] || { echo "ERROR: WireGuard config not found at $new_conf." >&2; exit 1; }
+
+  apply_wg_conf "$new_conf"
+
+  echo "==> Stopping qBittorrent + VPN (leak-proof order)..."
+  systemctl stop qbittorrent-nox 2>/dev/null || true
+  systemctl stop vpn-netns 2>/dev/null || true
+
+  # Self-heal any leftover state from crashed/partial runs
+  # (e.g. a stale 'wg0' that makes wg-quick abort with "already exists").
+  ip netns exec ${NS_NAME} wg-quick down wg0 2>/dev/null || true
+  ip link del veth-host 2>/dev/null || true
+  ip netns del ${NS_NAME} 2>/dev/null || true
+
+  echo "==> Starting VPN..."
+  systemctl start vpn-netns
+  for _ in $(seq 1 15); do
+    ip netns exec ${NS_NAME} wg show wg0 latest-handshakes 2>/dev/null | grep -qv $'\t0' && break
+    sleep 1
+  done
+
+  echo "==> Starting qBittorrent..."
+  systemctl start qbittorrent-nox
+
+  if [ -f /opt/vpn-netns/status.sh ]; then /opt/vpn-netns/status.sh || true; fi
+  echo "==> New VPN egress:"
+  ip netns exec ${NS_NAME} curl -fsSL --max-time 15 https://am.i.mullvad.net/json 2>/dev/null \
+    | jq -c '{ip: .ip, city: .city, country: .country, mullvad: (.mullvad_exit_ip == true)}' \
+    || echo "  (egress check failed - tunnel may still be handshaking)"
+}
+
 # ---------- PRE-FLIGHT CHECKS ----------------------------------------------
 [[ $EUID -eq 0 ]] || { echo "Please run as root."; exit 1; }
+
+# --change-vpn: switch the WireGuard profile without touching anything else.
+if [[ "${1:-}" == "--change-vpn" ]]; then
+  change_vpn
+  exit 0
+fi
 [[ -d "$NAS_PATH" ]] || { echo "ERROR: $NAS_PATH does not exist."; exit 1; }
 [[ -f "$WG_CONF_SRC" ]] || { echo "ERROR: WireGuard config not found at $WG_CONF_SRC.
 Export a standard WireGuard client .conf from your VPN provider and copy it there
@@ -96,64 +206,19 @@ usermod -aG medianas mediasvc
 # but auditable and minimal - very different from "allow the whole LAN out".
 echo "==> Setting up the isolated VPN network namespace..."
 
-cp "$WG_CONF_SRC" /etc/wireguard/wg0.conf
-chmod 600 /etc/wireguard/wg0.conf
-# Normalize provider confs: strip CRLF and repair any PersistentKeepalive line that
-# an earlier append glued onto the previous line (source conf without trailing newline).
-sed -i 's/\r$//' /etc/wireguard/wg0.conf
-sed -i -E 's/([0-9])[[:space:]]*([Pp]ersistentKeepalive[[:space:]]*=)/\1\n\2/' /etc/wireguard/wg0.conf
-
-# Extract the provider's DNS server (works for ANY WireGuard provider, since they all use the same standard "DNS = x.x.x.x" line) and force ALL DNS lookups made inside the namespace through it.
-# Since the namespace's only route out is the tunnel, DNS queries fail closed if the VPN is down -
-# exactly what protects against leaking which sites/trackers we're resolving.
-WG_DNS=$(grep -iE '^\s*DNS\s*=' /etc/wireguard/wg0.conf | head -n1 | awk -F'=' '{print $2}' | cut -d',' -f1 | tr -d ' \t')
-[[ -n "$WG_DNS" ]] || WG_DNS="9.9.9.9"
-mkdir -p /etc/netns/${NS_NAME}
-echo "nameserver ${WG_DNS}" > /etc/netns/${NS_NAME}/resolv.conf
-# Remove the DNS line from wg0.conf itself - wg-quick's own resolvconf hook
-# isn't namespace-aware and would otherwise fight with the override above.
-sed -i '/^\s*DNS\s*=/Id' /etc/wireguard/wg0.conf
-
-# Extract the provider's Endpoint. In a brand-new namespace there is NO route to it yet, so wg-quick's initial handshake would be unroutable.
-# We add a specific host-route (in up.sh below) that lets ONLY the Endpoint IP reach the host; 
-# every other packet still routes through the tunnel, so this stays leak-proof.
-WG_ENDPOINT=$(grep -iE '^\s*Endpoint\s*=' /etc/wireguard/wg0.conf | head -n1 | sed -E 's/^[[:space:]]*[Ee]ndpoint[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//')
-[[ -n "$WG_ENDPOINT" ]] || { echo "ERROR: No Endpoint line found in $WG_CONF_SRC."; exit 1; }
-WG_ENDPOINT_IP=${WG_ENDPOINT%:*}
-WG_ENDPOINT_IP=${WG_ENDPOINT_IP#[}
-WG_ENDPOINT_IP=${WG_ENDPOINT_IP%]}
-if [[ "$WG_ENDPOINT_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  :
-elif [[ "$WG_ENDPOINT_IP" =~ ^[0-9a-fA-F:]+$ ]]; then
-  echo "ERROR: IPv6 WireGuard Endpoints are not supported by this script ($WG_ENDPOINT_IP)." >&2; exit 1
-else
-  WG_ENDPOINT_IP=$(getent ahostsv4 "$WG_ENDPOINT_IP" | awk 'NR==1{print $1}' || true)
-  [[ -n "$WG_ENDPOINT_IP" ]] || { echo "ERROR: Cannot resolve Endpoint host '$WG_ENDPOINT'." >&2; exit 1; }
-fi
-
-# Full-tunnel check: wg-quick only adds a default route when AllowedIPs covers 0.0.0.0/0
-# (either literally or as the 0.0.0.0/1 + 128.0.0.0/1 pair). Without it the namespace gets
-# no default route at all -> qBittorrent has no internet (fail-closed, no leak), and the
-# leak-check below will just report "unreachable".
-if ! grep -qiE '^\s*AllowedIPs\s*=\s*(0\.0\.0\.0/0|0\.0\.0\.0/1,?\s*128\.0\.0\.0/1)' /etc/wireguard/wg0.conf; then
-  echo "WARNING: wg0.conf does not look like a full-tunnel config (AllowedIPs is not 0.0.0.0/0)." >&2
-  echo "         The namespace will have no default route - qBittorrent will have no internet access." >&2
-fi
-
-# The tunnel carrier is NAT'ed through the host (MASQUERADE), so its conntrack entry
-# needs regular traffic to stay alive - host UDP NAT mappings otherwise expire after
-# 30-180 s idle and the tunnel needs a new handshake round (sporadic stalls).
-# Any existing value (incl. an explicit 0) is respected and not overridden.
-if ! grep -qiE '^\s*PersistentKeepalive\s*=' /etc/wireguard/wg0.conf; then
-  printf '\nPersistentKeepalive = 25\n' >> /etc/wireguard/wg0.conf
-  echo "NOTE: 'PersistentKeepalive = 25' added to wg0.conf (needed because the carrier is NAT'ed)."
-fi
+apply_wg_conf "$WG_CONF_SRC"
 
 mkdir -p /opt/vpn-netns
 cat > /opt/vpn-netns/up.sh <<EOF
 #!/usr/bin/env bash
 set -e
-ip netns add ${NS_NAME} 2>/dev/null || true
+# Self-heal: clear leftovers from a crashed/partial previous run before bringing
+# everything up fresh (otherwise wg-quick aborts with "'wg0' already exists").
+ip netns exec ${NS_NAME} wg-quick down wg0 2>/dev/null || true
+ip link del veth-host 2>/dev/null || true
+ip netns del ${NS_NAME} 2>/dev/null || true
+sleep 1
+ip netns add ${NS_NAME}
 ip netns exec ${NS_NAME} ip link set lo up
 
 ip link add veth-host type veth peer name veth-ns 2>/dev/null || true
