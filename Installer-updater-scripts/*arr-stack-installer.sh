@@ -100,7 +100,7 @@ change_vpn() {
 
   local new_conf
   echo "==> VPN profile change (current: ${WG_CONF_SRC})"
-  read -re -i "$WG_CONF_SRC" -p "Pfad zur neuen WireGuard-Konfiguration (Enter = aktuell): " new_conf || true
+  read -re -i "$WG_CONF_SRC" -p "Path to the new WireGuard config (Enter = keep current): " new_conf || true
   new_conf="${new_conf:-$WG_CONF_SRC}"
   [[ -f "$new_conf" ]] || { echo "ERROR: WireGuard config not found at $new_conf." >&2; exit 1; }
 
