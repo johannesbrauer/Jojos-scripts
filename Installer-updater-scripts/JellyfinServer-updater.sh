@@ -16,6 +16,9 @@ set -uo pipefail
 # Config
 SERVICE_NAME="jellyfin"
 DATA_DIR_OVERRIDE=""
+# Directory Jellyfin may read/write (e.g. /mnt/media/movies). Empty = not added to the
+# systemd unit. Set via environment (MEDIA_DIR=/mnt/media ./jellyfin-updater.sh) or here.
+MEDIA_DIR="${MEDIA_DIR:-}"
 BACKUP_DIR="/var/backups/jellyfin-updater"
 KEEP_BACKUPS=5
 LOG_FILE="/var/log/jellyfin-updater.log"
@@ -107,9 +110,44 @@ ask_migrate_to_systemd() {
   [[ "$response" =~ ^[Nn] ]] && return 1; return 0
 }
 
+service_user() {
+  [ -n "$JELLYFIN_PROCESS_USER" ] && { echo "$JELLYFIN_PROCESS_USER"; return 0; }
+  local unit_file user
+  unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME" 2>/dev/null)"
+  if [ -f "$unit_file" ]; then
+    user="$(sed -n 's/^User=//p' "$unit_file" 2>/dev/null | head -n1 | tr -d '[:space:]')"
+    [ -n "$user" ] && { echo "$user"; return 0; }
+  fi
+  echo root
+}
+
+as_user() {
+  local user="$1"; shift
+  if command -v runuser >/dev/null 2>&1; then runuser -u "$user" -- "$@"
+  else sudo -u "$user" "$@"; fi
+}
+
+# MEDIA_DIR must be usable by the service user before we touch anything, otherwise the
+# unit would come up with a ReadWritePaths entry that does not exist and systemd would
+# refuse to start jellyfin.
+validate_media_dir() {
+  [ -z "$MEDIA_DIR" ] && return 0
+  case "$MEDIA_DIR" in /*) ;; *) die "MEDIA_DIR '$MEDIA_DIR' is not an absolute path" ;; esac
+  [ -d "$MEDIA_DIR" ] || die "MEDIA_DIR '$MEDIA_DIR' does not exist or is not a directory — create it, point MEDIA_DIR at an existing path, or leave MEDIA_DIR empty"
+  local user; user="$(service_user)"
+  as_user "$user" test -r "$MEDIA_DIR" || die "MEDIA_DIR '$MEDIA_DIR' is not readable by service user '$user'"
+  as_user "$user" test -w "$MEDIA_DIR" || die "MEDIA_DIR '$MEDIA_DIR' is not writable by service user '$user' — fix it with: chown $user '$MEDIA_DIR' (or set MEDIA_DIR to a writable path)"
+  log "MEDIA_DIR '$MEDIA_DIR' is readable and writable by '$user'"
+  case "$MEDIA_DIR" in /home/*|/root/*)
+    log "NOTE: MEDIA_DIR is under a home directory; the unit sets ProtectHome=read-only, so verify jellyfin can still write there" ;;
+  esac
+}
+
 create_systemd_service() {
-  local service_user="${JELLYFIN_PROCESS_USER:-root}" service_file="/etc/systemd/system/jellyfin.service"
-  log "Creating systemd service for user '$service_user'..."
+  local svc_user="${JELLYFIN_PROCESS_USER:-root}" service_file="/etc/systemd/system/jellyfin.service"
+  local media_env="" rw_extra=""
+  [ -n "$MEDIA_DIR" ] && { media_env="Environment=JELLYFIN_MEDIA_DIR=$MEDIA_DIR"; rw_extra=" $MEDIA_DIR"; }
+  log "Creating systemd service for user '$svc_user'..."
   mkdir -p "$DATA_DIR" "$CONFIG_DIR" "$LOG_DIR" "$CACHE_DIR"
   cat > "$service_file" <<EOF
 [Unit]
@@ -119,13 +157,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=$service_user
-Group=$service_user
+User=$svc_user
+Group=$svc_user
 WorkingDirectory=$INSTALL_DIR
 Environment=JELLYFIN_DATA_DIR=$DATA_DIR
 Environment=JELLYFIN_CONFIG_DIR=$CONFIG_DIR
 Environment=JELLYFIN_LOG_DIR=$LOG_DIR
 Environment=JELLYFIN_CACHE_DIR=$CACHE_DIR
+Environment="MALLOC_TRIM_THRESHOLD_=100000"
+Environment=DOTNET_EnableWriteFilePreallocation=0
+$media_env
 ExecStart=$BIN_PATH --datadir $DATA_DIR --configdir $CONFIG_DIR --logdir $LOG_DIR --cachedir $CACHE_DIR
 Restart=on-failure
 RestartSec=10
@@ -135,19 +176,80 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=$DATA_DIR $CONFIG_DIR $LOG_DIR $CACHE_DIR $INSTALL_DIR
+ReadWritePaths=$DATA_DIR $CONFIG_DIR $LOG_DIR $CACHE_DIR $INSTALL_DIR$rw_extra
 
 [Install]
 WantedBy=multi-user.target
 EOF
   chmod 644 "$service_file"; systemctl daemon-reload; systemctl enable jellyfin.service 2>/dev/null
+  ensure_unit_env "$service_file"
   log "Systemd service created: $service_file"; RUNNING_VIA_SYSTEMD=true
 }
 
+# How MEDIA_DIR is written inside a unit file (systemd quoting for paths with spaces).
+media_unit_path() {
+  case "$MEDIA_DIR" in *[[:space:]]*) printf '"%s"' "$MEDIA_DIR" ;; *) printf '%s' "$MEDIA_DIR" ;; esac
+}
+
+# Appends a line to the [Service] section: after the last Environment= line if there is
+# one, otherwise directly below [Service]. Writes via a temp file + cat so the unit keeps
+# its ownership, mode and inode.
+insert_unit_line() {
+  local file="$1" line="$2" tmp
+  tmp="$(mktemp)" || return 1
+  if grep -q '^Environment=' "$file"; then
+    awk -v l="$line" '{ a[NR]=$0; if ($0 ~ /^Environment=/) last=NR }
+      END { for (i=1; i<=NR; i++) { print a[i]; if (i==last) print l } }' "$file" > "$tmp"
+  else
+    awk -v l="$line" '{ print; if ($0 ~ /^\[Service\]/) print l }' "$file" > "$tmp"
+  fi
+  cat "$tmp" > "$file"; rm -f "$tmp"
+}
+
+# Idempotently guarantees the runtime env vars and the MEDIA_DIR read-write path on an
+# existing unit. Called after every point where a unit file is created or modified.
+# $1 = unit file, defaults to the active unit's FragmentPath.
+ensure_unit_env() {
+  local unit_file="${1:-}"
+  [ -n "$unit_file" ] || unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME" 2>/dev/null)"
+  [ -n "$unit_file" ] && [ -f "$unit_file" ] || return 0
+  log "Ensuring unit env/paths in $unit_file"
+  local changed=false
+  if ! grep -qE '^Environment="?MALLOC_TRIM_THRESHOLD_=' "$unit_file"; then
+    if insert_unit_line "$unit_file" 'Environment="MALLOC_TRIM_THRESHOLD_=100000"' \
+       && grep -qF 'MALLOC_TRIM_THRESHOLD_=' "$unit_file"; then changed=true
+    else log "WARNING: could not add MALLOC_TRIM_THRESHOLD_ to $unit_file"; fi
+  fi
+  if ! grep -q '^Environment=DOTNET_EnableWriteFilePreallocation=' "$unit_file"; then
+    if insert_unit_line "$unit_file" 'Environment=DOTNET_EnableWriteFilePreallocation=0' \
+       && grep -qF 'DOTNET_EnableWriteFilePreallocation=' "$unit_file"; then changed=true
+    else log "WARNING: could not add DOTNET_EnableWriteFilePreallocation to $unit_file"; fi
+  fi
+  if [ -n "$MEDIA_DIR" ]; then
+    local media_path; media_path="$(media_unit_path)"
+    if grep '^ReadWritePaths=' "$unit_file" | grep -qF " $media_path"; then
+      log "ReadWritePaths already grants $MEDIA_DIR"
+    elif grep -q '^ReadWritePaths=' "$unit_file"; then
+      local tmp; tmp="$(mktemp)"
+      if awk -v m="$media_path" '{ if (!done && /^ReadWritePaths=/) { print $0 " " m; done=1 } else print }' \
+           "$unit_file" > "$tmp"; then
+        cat "$tmp" > "$unit_file"; changed=true
+      fi
+      rm -f "$tmp"
+      log "Added $MEDIA_DIR to ReadWritePaths in $unit_file"
+    elif insert_unit_line "$unit_file" "ReadWritePaths=$media_path" \
+         && grep -qF "ReadWritePaths=" "$unit_file"; then
+      changed=true; log "Added ReadWritePaths=$MEDIA_DIR to $unit_file"
+    else log "WARNING: could not add ReadWritePaths=$MEDIA_DIR to $unit_file"; fi
+  fi
+  $changed && { systemctl daemon-reload; log "Reloaded systemd after updating $unit_file"; }
+  return 0
+}
+
 fix_permissions() {
-  local service_user="${JELLYFIN_PROCESS_USER:-root}"
-  chown -R "$service_user:$service_user" "$DATA_DIR" "$CONFIG_DIR" "$LOG_DIR" "$CACHE_DIR" 2>/dev/null || true
-  [ -d "$INSTALL_DIR" ] && chown -R "$service_user:$service_user" "$INSTALL_DIR" 2>/dev/null || true
+  local svc_user; svc_user="$(service_user)"
+  chown -R "$svc_user:$svc_user" "$DATA_DIR" "$CONFIG_DIR" "$LOG_DIR" "$CACHE_DIR" 2>/dev/null || true
+  [ -d "$INSTALL_DIR" ] && chown -R "$svc_user:$svc_user" "$INSTALL_DIR" 2>/dev/null || true
 }
 
 stop_jellyfin() {
@@ -336,6 +438,7 @@ deploy() {
     log "Binary path changed ($BIN_PATH -> $new_bin_final), updating systemd unit"
     local unit_file; unit_file="$(systemctl show -p FragmentPath --value "$SERVICE_NAME")"
     sed -i "s|^ExecStart=$BIN_PATH |ExecStart=$new_bin_final |" "$unit_file"
+    ensure_unit_env "$unit_file"
     systemctl daemon-reload; BIN_PATH="$new_bin_final"
   fi
   BIN_PATH="$new_bin_final"
@@ -379,6 +482,7 @@ health_check() {
 
 run_update() {
   require_root; TMP_DIR="$(mktemp -d)"; ARCH="$(detect_arch)"; find_installation
+  validate_media_dir
   # Fix overlapping data/config dirs — Jellyfin 10.11+ / v12 refuses to start if both markers share a directory
   if [ "$CONFIG_DIR" = "$DATA_DIR" ]; then
     log "WARNING: Data and config directories overlap ($CONFIG_DIR). Separating config to $DATA_DIR/config for v12+ compatibility."
@@ -435,6 +539,13 @@ Usage: $(basename "$0") [--update] [--update-migrate] [--install-cron ["CRON_SCH
   --update-migrate  Update and migrate user process to systemd service
   --install-cron    Set up a cronjob, default schedule: "0 4 * * *"
   --help            Show this help
+
+Environment:
+  MEDIA_DIR         Directory Jellyfin may read/write, added to the unit's
+                    ReadWritePaths and exposed as JELLYFIN_MEDIA_DIR. Must
+                    exist and be read/writable by the service user. Empty (the
+                    default) = not added to the unit.
+                    Example: sudo MEDIA_DIR=/mnt/media/movies ./jellyfin-updater.sh
 EOF
   ;; *) echo "Unknown option: $1" >&2; exit 1 ;;
 esac
