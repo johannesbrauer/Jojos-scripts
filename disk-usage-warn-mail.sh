@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# check_disk.sh - Checks disk usage and sends an email via curl (SMTP)
+# disk-usage-warn-mail.sh - Checks disk usage and sends an email via curl (SMTP)
 # whenever a threshold is exceeded.
 #
 # Tested with busybox ash (Alpine Linux).
