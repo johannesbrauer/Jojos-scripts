@@ -62,7 +62,9 @@ do_full_backup() {
     local used_mb init_mb
     used_mb=$(df -m --output=used / | tail -1 | tr -d ' ')
     # Temporary size for the initial copy only; shrunk away afterwards.
-    init_mb=$((used_mb + 512))
+    local buffer_mb=$((used_mb * 5 / 100))
+    [ "$buffer_mb" -lt 2048 ] && buffer_mb=2048
+    init_mb=$((used_mb + buffer_mb))
     log "No existing image at ${img} - starting full backup (initial ${init_mb} MB, then shrink + ${reserve_mb} MB reserve)"
     "$IMAGE_BACKUP" -i "${img},${init_mb},${reserve_mb}" >>"$LOG" 2>&1
 }
