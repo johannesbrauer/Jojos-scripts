@@ -8,7 +8,7 @@
 #
 #    --servarr       Prowlarr, Radarr, Sonarr, Lidarr, Whisparr
 #    --qBittorrent   qBittorrent-nox (apt, exactly like the installer)
-#    --Homarr        Homarr (git tag + pnpm build, like the installer)
+#    --Homarr        Homarr (git tag; v1 = pnpm, v2+ = Bun, like the installer)
 #    --Seerr         Seerr (git main + embedded Node 22 + pnpm 10, like the installer)
 #    --Byparr        git pull /opt/Byparr + restart its systemd unit (no backup)
 #
@@ -44,17 +44,28 @@ MEDIANAS_GROUP="medianas"
 QBIT_CONFIG_DIR="/home/qbtuser/.config/qBittorrent"
 
 # Homarr (source build, like the installer).
+# v1 = pnpm + the three units below; v2+ = Bun + a single unit. Bun is installed
+# system-wide on demand (the installer only provisioned the system's Node 24).
 HOMARR_DIR="/opt/homarr"
 HOMARR_DATA_DIR="/opt/homarr-data"
 HOMARR_HEALTH_URL="http://127.0.0.1:3000/api/health/live"
 HOMARR_UNITS=(homarr-nextjs homarr-websocket homarr-tasks)
+HOMARR_SERVICE="homarr.service"
+SYSTEMD_UNIT_DIR="/etc/systemd/system"
+BUN_BIN="/usr/local/bin/bun"
+BUN_VERSION="1.4.2"
+HOMARR_MIN_NODE="24.18.0"
+HOMARR_NODE_MAJOR="24"
 
 # Seerr (source build with the private Node 22 + pnpm 10 the installer embedded).
+# Keep these majors unchanged: the Homarr v2 path must never disturb them.
 SEERR_DIR="/opt/seerr"
 SEERR_BRANCH="main"
 SEERR_HEALTH_URL="http://127.0.0.1:5055/api/v1/status"
 NODE22_DIR="/opt/seerr-node"
 PNPM10_DIR="/opt/pnpm10"
+SEERR_NODE_MAJOR="22"
+SEERR_PNPM_MAJOR="10"
 
 # Byparr (pull-only; must already be installed at $BYPARR_DIR with a systemd unit).
 BYPARR_DIR="/opt/Byparr"
@@ -364,7 +375,112 @@ update_qbittorrent() {
 }
 
 # ---------- HOMARR -----------------------------------------------------------
-homarr_build() {
+# Homarr v1 is a pnpm/Next.js build with three units (nextjs, websocket, tasks).
+# Homarr v2 dropped pnpm for Bun and runs as one process (websocket/tasks are
+# embedded), so it needs Bun + a single unit. Both share the same data dir/.env.
+major_of() {
+  local t="${1#v}"
+  printf '%s' "${t%%.*}"
+}
+
+# version_ge <a> <b> -> true when dotted-numeric a >= b.
+version_ge() {
+  local -a a b
+  local i av bv
+  IFS=. read -r -a a <<< "$1"
+  IFS=. read -r -a b <<< "$2"
+  for ((i = 0; i < ${#b[@]}; i++)); do
+    av="${a[i]:-0}"; bv="${b[i]:-0}"
+    ((10#$av > 10#$bv)) && return 0
+    ((10#$av < 10#$bv)) && return 1
+  done
+  return 0
+}
+
+# Install the pinned Bun system-wide ($HOME/.bun is useless to systemd).
+ensure_bun() {
+  local have
+  if [[ -x "$BUN_BIN" ]]; then
+    have="$("$BUN_BIN" --version 2>/dev/null || true)"
+    if version_ge "$have" "$BUN_VERSION"; then
+      log "Homarr: Bun ${have} already installed"
+      return 0
+    fi
+  fi
+  log "Homarr: installing Bun ${BUN_VERSION} into /usr/local ..."
+  command -v unzip >/dev/null 2>&1 \
+    || DEBIAN_FRONTEND=noninteractive apt-get install -y unzip >>"$LOG_FILE" 2>&1 || true
+  if ! curl -fsSL https://bun.sh/install 2>>"$LOG_FILE" \
+       | BUN_INSTALL=/usr/local bash -s "bun-v${BUN_VERSION}" >>"$LOG_FILE" 2>&1; then
+    log "ERROR Homarr: Bun install script failed"
+    return 1
+  fi
+  [[ -x "$BUN_BIN" ]] || { log "ERROR Homarr: ${BUN_BIN} missing after install"; return 1; }
+  log "Homarr: Bun $("$BUN_BIN" --version) installed"
+}
+
+# Homarr v2 needs Node >= 24.18 system-wide (used by `bun run build/start`).
+# Seerr keeps its own Node 22 + pnpm 10; never touch those - only verify.
+ensure_node_24() {
+  local v sv pv
+  v="$(node -v 2>/dev/null || true)"; v="${v#v}"
+  if [[ -n "$v" ]] && version_ge "$v" "$HOMARR_MIN_NODE"; then
+    log "Homarr: system Node ${v} OK"
+  else
+    log "Homarr: installing Node ${HOMARR_NODE_MAJOR} (need >= ${HOMARR_MIN_NODE}) ..."
+    if ! curl -fsSL "https://deb.nodesource.com/setup_${HOMARR_NODE_MAJOR}.x" 2>>"$LOG_FILE" \
+         | bash - >>"$LOG_FILE" 2>&1; then
+      log "ERROR Homarr: nodesource setup failed"
+      return 1
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs >>"$LOG_FILE" 2>&1 \
+      || { log "ERROR Homarr: Node install failed"; return 1; }
+    v="$(node -v 2>/dev/null || true)"; v="${v#v}"
+    version_ge "$v" "$HOMARR_MIN_NODE" \
+      || { log "ERROR Homarr: Node ${v:-missing} is still < ${HOMARR_MIN_NODE}"; return 1; }
+    # A Node reinstall can drop the global pnpm the v1 rollback path needs.
+    command -v pnpm >/dev/null 2>&1 \
+      || npm install -g pnpm@11.15.1 --silent >>"$LOG_FILE" 2>&1 || true
+    log "Homarr: system Node ${v} installed"
+  fi
+
+  if [[ -x "${NODE22_DIR}/bin/node" ]]; then
+    sv="$("${NODE22_DIR}/bin/node" -v 2>/dev/null | sed 's/^v//')"
+    [[ "$(major_of "$sv")" == "$SEERR_NODE_MAJOR" ]] \
+      || { log "ERROR Homarr: ${NODE22_DIR}/bin/node is ${sv:-missing}, expected v${SEERR_NODE_MAJOR}.x - aborting so Seerr stays intact"; return 1; }
+  fi
+  if [[ -x "${PNPM10_DIR}/bin/pnpm" ]]; then
+    pv="$(PATH="${PNPM10_DIR}/bin:${NODE22_DIR}/bin:$PATH" pnpm --version 2>/dev/null || true)"
+    [[ "$(major_of "$pv")" == "$SEERR_PNPM_MAJOR" ]] \
+      || { log "ERROR Homarr: ${PNPM10_DIR}/bin/pnpm is ${pv:-missing}, expected ${SEERR_PNPM_MAJOR}.x - aborting so Seerr stays intact"; return 1; }
+  fi
+  return 0
+}
+
+ensure_redis() {
+  command -v redis-server >/dev/null 2>&1 \
+    || { log "ERROR Homarr: redis-server not installed (required by Homarr v2)"; return 1; }
+  systemctl enable --now redis-server >/dev/null 2>&1 || true
+  systemctl is-active --quiet redis-server \
+    || { log "ERROR Homarr: redis-server is not running"; return 1; }
+}
+
+# v2 rejects empty secrets; append only what is missing (never rewrite a key).
+homarr_ensure_env() {
+  local env="$HOMARR_DIR/.env"
+  [[ -f "$env" ]] || { log "ERROR Homarr: ${env} missing"; return 1; }
+  grep -q '^SECRET_ENCRYPTION_KEY=.' "$env" \
+    || echo "SECRET_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> "$env"
+  grep -q '^AUTH_SECRET=.' "$env" \
+    || echo "AUTH_SECRET=$(openssl rand -base64 32)" >> "$env"
+  grep -q '^DB_DRIVER=' "$env"  || echo "DB_DRIVER=better-sqlite3" >> "$env"
+  grep -q '^DB_URL=' "$env"     || echo "DB_URL=${HOMARR_DATA_DIR}/db/db.sqlite" >> "$env"
+  grep -q '^DB_DIALECT=' "$env" || echo "DB_DIALECT=sqlite" >> "$env"
+  return 0
+}
+
+# v1: pnpm (unchanged from the installer).
+homarr_build_v1() {
   local dir="$1"
   (
     cd "$dir"
@@ -372,37 +488,160 @@ homarr_build() {
   ) >>"$LOG_FILE" 2>&1
 }
 
-# Re-resolve the next/tsx binaries and rewrite the unit ExecStart lines so a
-# rebuild cannot leave the installer's units pointing at a stale workspace path.
-homarr_fix_units() {
-  local next_bin tsx_bin f
-  next_bin="$(find /opt/homarr -maxdepth 6 -type l -path '*/.bin/next' 2>/dev/null | head -n1 || true)"
-  if [[ -z "$next_bin" ]]; then
-    next_bin="$(cd /opt/homarr/apps/nextjs 2>/dev/null && pnpm exec which next 2>/dev/null || true)"
+# v2: Bun + Turbo. The repo's `build` script only assembles a standalone
+# artifact, so fall back to the nextjs compiled build if no .next is produced.
+homarr_build_v2() {
+  local dir="$1"
+  (
+    export PATH="/usr/local/bin:${PATH}"
+    local built=0
+    cd "$dir" || exit 1
+    "$BUN_BIN" install --frozen-lockfile || exit 1
+    "$BUN_BIN" run db:migration:sqlite:run || exit 1
+    if "$BUN_BIN" run build; then built=1; fi
+    if [[ "$built" != 1 || ! -f apps/nextjs/.next/BUILD_ID ]]; then
+      echo "WARN Homarr: 'bun run build' failed/incomplete; trying apps/nextjs build:compiled" >&2
+      ( cd apps/nextjs && "$BUN_BIN" run build:compiled ) || exit 1
+    fi
+    [[ -f apps/nextjs/.next/BUILD_ID ]] || exit 1
+  ) >>"$LOG_FILE" 2>&1
+}
+
+homarr_build() {
+  local dir="$1" gen="$2"
+  if [[ "$gen" -ge 2 ]]; then
+    homarr_build_v2 "$dir"
+  else
+    homarr_build_v1 "$dir"
   fi
-  tsx_bin="$(find /opt/homarr -maxdepth 6 -type l -path '*/.bin/tsx' 2>/dev/null | head -n1 || true)"
+}
+
+# Re-resolve the pnpm workspace binaries and (re)write the three v1 units.
+homarr_write_v1_units() {
+  local next_bin tsx_bin
+  next_bin="$(find "$HOMARR_DIR" -maxdepth 6 -type l -path '*/.bin/next' 2>/dev/null | head -n1 || true)"
+  if [[ -z "$next_bin" ]]; then
+    next_bin="$(cd "$HOMARR_DIR/apps/nextjs" 2>/dev/null && pnpm exec which next 2>/dev/null || true)"
+  fi
+  tsx_bin="$(find "$HOMARR_DIR" -maxdepth 6 -type l -path '*/.bin/tsx' 2>/dev/null | head -n1 || true)"
   if [[ -z "$tsx_bin" ]]; then
-    tsx_bin="$(cd /opt/homarr/apps/websocket 2>/dev/null && pnpm exec which tsx 2>/dev/null || true)"
+    tsx_bin="$(cd "$HOMARR_DIR/apps/websocket" 2>/dev/null && pnpm exec which tsx 2>/dev/null || true)"
   fi
   if [[ -z "$next_bin" || -z "$tsx_bin" ]]; then
-    log "WARN Homarr: could not resolve next/tsx binaries; leaving units unchanged"
+    log "ERROR Homarr: could not resolve next/tsx binaries for the v1 units"
     return 1
   fi
-  f=/etc/systemd/system/homarr-nextjs.service
-  [[ -f "$f" ]] && sed -i "s|^ExecStart=.*|ExecStart=${next_bin} start -p 3000|" "$f"
-  f=/etc/systemd/system/homarr-websocket.service
-  [[ -f "$f" ]] && sed -i "s|^ExecStart=.*|ExecStart=${tsx_bin} /opt/homarr/apps/websocket/src/main.ts|" "$f"
-  f=/etc/systemd/system/homarr-tasks.service
-  [[ -f "$f" ]] && sed -i "s|^ExecStart=.*|ExecStart=${tsx_bin} /opt/homarr/apps/tasks/src/main.ts|" "$f"
+
+  cat > "${SYSTEMD_UNIT_DIR}/homarr-nextjs.service" <<EOF
+[Unit]
+Description=Homarr nextjs
+After=network.target
+
+[Service]
+Type=simple
+User=${MEDIASVC_USER}
+Group=${MEDIANAS_GROUP}
+WorkingDirectory=${HOMARR_DIR}/apps/nextjs
+Environment=NODE_ENV=production
+EnvironmentFile=${HOMARR_DIR}/.env
+ExecStart=${next_bin} start -p 3000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > "${SYSTEMD_UNIT_DIR}/homarr-websocket.service" <<EOF
+[Unit]
+Description=Homarr websocket
+After=network.target
+
+[Service]
+Type=simple
+User=${MEDIASVC_USER}
+Group=${MEDIANAS_GROUP}
+WorkingDirectory=${HOMARR_DIR}
+Environment=NODE_ENV=production
+EnvironmentFile=${HOMARR_DIR}/.env
+ExecStart=${tsx_bin} ${HOMARR_DIR}/apps/websocket/src/main.ts
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > "${SYSTEMD_UNIT_DIR}/homarr-tasks.service" <<EOF
+[Unit]
+Description=Homarr tasks
+After=network.target
+
+[Service]
+Type=simple
+User=${MEDIASVC_USER}
+Group=${MEDIANAS_GROUP}
+WorkingDirectory=${HOMARR_DIR}
+Environment=NODE_ENV=production
+EnvironmentFile=${HOMARR_DIR}/.env
+ExecStart=${tsx_bin} ${HOMARR_DIR}/apps/tasks/src/main.ts
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  # Only one generation may be enabled (they all bind port 3000).
+  systemctl stop "$HOMARR_SERVICE" 2>/dev/null || true
+  systemctl disable "$HOMARR_SERVICE" 2>/dev/null || true
+  rm -f "${SYSTEMD_UNIT_DIR}/${HOMARR_SERVICE}"
+  return 0
+}
+
+# Write the single v2 unit and remove the three v1 units.
+homarr_write_v2_unit() {
+  local u
+  cat > "${SYSTEMD_UNIT_DIR}/${HOMARR_SERVICE}" <<EOF
+[Unit]
+Description=Homarr
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+Type=simple
+User=${MEDIASVC_USER}
+Group=${MEDIANAS_GROUP}
+WorkingDirectory=${HOMARR_DIR}
+Environment=NODE_ENV=production
+EnvironmentFile=${HOMARR_DIR}/.env
+ExecStart=${BUN_BIN} run start
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  for u in "${HOMARR_UNITS[@]}"; do
+    systemctl stop "$u" 2>/dev/null || true
+    systemctl disable "$u" 2>/dev/null || true
+    rm -f "${SYSTEMD_UNIT_DIR}/${u}.service"
+  done
   return 0
 }
 
 homarr_health() {
-  local i
+  local gen="$1" i active
   for ((i = 1; i <= HEALTH_RETRIES; i++)); do
-    if systemctl is-active --quiet homarr-nextjs \
-       && { curl -fsSL --max-time 5 "$HOMARR_HEALTH_URL" >/dev/null 2>&1 \
-            || curl -fsSL --max-time 5 "http://127.0.0.1:3000/" >/dev/null 2>&1; }; then
+    active=0
+    if [[ "$gen" -ge 2 ]]; then
+      systemctl is-active --quiet "$HOMARR_SERVICE" && active=1
+    else
+      systemctl is-active --quiet homarr-nextjs && active=1
+    fi
+    if [[ "$active" == 1 ]] && { curl -fsSL --max-time 5 "$HOMARR_HEALTH_URL" >/dev/null 2>&1 \
+         || curl -fsSL --max-time 5 "http://127.0.0.1:3000/" >/dev/null 2>&1; }; then
       return 0
     fi
     sleep "$HEALTH_DELAY"
@@ -410,14 +649,54 @@ homarr_health() {
   return 1
 }
 
-homarr_start() { systemctl daemon-reload; systemctl start "${HOMARR_UNITS[@]}" 2>/dev/null || true; }
-homarr_stop()  { systemctl stop "${HOMARR_UNITS[@]}" 2>/dev/null || true; }
+homarr_stop_gen() {
+  if [[ "$1" -ge 2 ]]; then
+    systemctl stop "$HOMARR_SERVICE" 2>/dev/null || true
+  else
+    systemctl stop "${HOMARR_UNITS[@]}" 2>/dev/null || true
+  fi
+}
+
+homarr_start_gen() {
+  systemctl daemon-reload
+  if [[ "$1" -ge 2 ]]; then
+    systemctl enable --now "$HOMARR_SERVICE" >/dev/null 2>&1 \
+      || systemctl start "$HOMARR_SERVICE" 2>/dev/null || true
+  else
+    systemctl enable --now "${HOMARR_UNITS[@]}" >/dev/null 2>&1 \
+      || systemctl start "${HOMARR_UNITS[@]}" 2>/dev/null || true
+  fi
+}
+
+# Roll back to <tag> using <gen>'s toolchain/units, restoring the DB backup.
+homarr_rollback() {
+  local current="$1" gen="$2" failed_gen="$3"
+  homarr_stop_gen 1
+  homarr_stop_gen 2
+  if [[ "$failed_gen" != "$gen" ]]; then
+    log "Homarr: clearing v${failed_gen} build artifacts before the v${gen} rollback"
+    rm -rf "$HOMARR_DIR/apps/nextjs/.next" "$HOMARR_DIR/apps/nextjs/.output" "$HOMARR_DIR/.turbo"
+    find "$HOMARR_DIR" -type d -name node_modules -prune -exec rm -rf {} + 2>/dev/null || true
+  fi
+  git_dir "$HOMARR_DIR" checkout --quiet "$current" 2>/dev/null || true
+  restore_backup "$CURRENT_BACKUP" "$HOMARR_DATA_DIR" || true
+  homarr_build "$HOMARR_DIR" "$gen" || log "WARN Homarr: rollback rebuild failed"
+  if [[ "$gen" -ge 2 ]]; then
+    homarr_write_v2_unit || log "WARN Homarr: could not restore ${HOMARR_SERVICE}"
+  else
+    homarr_write_v1_units || log "WARN Homarr: could not restore v1 units"
+  fi
+  chown -R "${MEDIASVC_USER}:${MEDIANAS_GROUP}" "$HOMARR_DIR" "$HOMARR_DATA_DIR" 2>/dev/null || true
+  systemctl daemon-reload
+  homarr_start_gen "$gen"
+  homarr_health "$gen" || log "WARN Homarr: still unhealthy after rollback"
+  return 1
+}
 
 update_homarr() {
-  local dir="$HOMARR_DIR" data="$HOMARR_DATA_DIR" current latest current_major latest_major target bp
+  local dir="$HOMARR_DIR" data="$HOMARR_DATA_DIR" current latest current_major latest_major target target_major bp
 
   [[ -d "$dir/.git" ]] || { log "SKIP Homarr: not installed at ${dir}"; return 0; }
-  command -v pnpm >/dev/null 2>&1 || { log "ERROR Homarr: pnpm not found"; return 1; }
 
   log "==> Homarr: fetching tags..."
   git_dir "$dir" fetch --tags --quiet || { log "ERROR Homarr: git fetch failed"; return 1; }
@@ -425,8 +704,8 @@ update_homarr() {
   current="$(git_dir "$dir" describe --tags --abbrev=0 2>/dev/null || true)"
   [[ -n "$current" ]] || { log "WARN Homarr: cannot determine installed tag"; return 1; }
   latest="$(git_dir "$dir" tag --sort=v:refname | tail -n1)"
-  current_major="$(echo "$current" | sed -E 's/^v?([0-9]+).*/\1/')"
-  latest_major="$(echo "$latest" | sed -E 's/^v?([0-9]+).*/\1/')"
+  current_major="$(major_of "$current")"
+  latest_major="$(major_of "$latest")"
   target="$latest"
 
   if [[ "$latest_major" != "$current_major" ]]; then
@@ -438,47 +717,69 @@ update_homarr() {
     fi
   fi
   [[ -n "$target" ]] || { log "WARN Homarr: no target tag found"; return 1; }
+  target_major="$(major_of "$target")"
   [[ "$target" == "$current" ]] && { log "Homarr already up to date (${current})"; return 0; }
 
-  log "==> Homarr: ${current} -> ${target}"
+  log "==> Homarr: ${current} -> ${target} (v${current_major} -> v${target_major} toolchain)"
+
+  # Preflight BEFORE stopping anything, so a missing tool leaves Homarr running.
+  if [[ "$target_major" -ge 2 ]]; then
+    ensure_node_24 || { log "ERROR Homarr: Node preflight failed"; return 1; }
+    ensure_redis   || { log "ERROR Homarr: Redis preflight failed"; return 1; }
+    homarr_ensure_env || { log "ERROR Homarr: .env preflight failed"; return 1; }
+    ensure_bun     || { log "ERROR Homarr: Bun preflight failed"; return 1; }
+  else
+    command -v pnpm >/dev/null 2>&1 || { log "ERROR Homarr: pnpm not found (v1 build)"; return 1; }
+  fi
+
   bp=("$data"); [[ -f "$dir/.env" ]] && bp+=("$dir/.env")
   backup_now "Homarr" "${bp[@]}" || { log "ERROR Homarr: backup failed"; return 1; }
 
-  homarr_stop
+  homarr_stop_gen "$current_major"
   if ! git_dir "$dir" checkout --quiet "$target"; then
     log "ERROR Homarr: checkout ${target} failed"
-    homarr_start
+    homarr_start_gen "$current_major"
     return 1
   fi
 
-  if ! homarr_build "$dir"; then
+  # A v1<->v2 jump swaps the whole toolchain; stale pnpm/Next artifacts would
+  # otherwise mask an incomplete v2 build (BUILD_ID from the old tree).
+  if [[ "$current_major" != "$target_major" ]]; then
+    log "Homarr: major toolchain change - clearing stale node_modules/.next/.output"
+    rm -rf "$dir/apps/nextjs/.next" "$dir/apps/nextjs/.output" "$dir/.turbo"
+    find "$dir" -type d -name node_modules -prune -exec rm -rf {} + 2>/dev/null || true
+  fi
+
+  if ! homarr_build "$dir" "$target_major"; then
     log "ERROR Homarr: build failed - rolling back to ${current}"
-    git_dir "$dir" checkout --quiet "$current" 2>/dev/null || true
-    restore_backup "$CURRENT_BACKUP" "$data" || true
-    homarr_build "$dir" || true
-    homarr_fix_units || true
-    chown -R "${MEDIASVC_USER}:${MEDIANAS_GROUP}" "$dir" "$data" 2>/dev/null || true
-    homarr_start
+    homarr_rollback "$current" "$current_major" "$target_major"
     return 1
   fi
 
-  homarr_fix_units || true
+  if [[ "$target_major" -ge 2 ]]; then
+    if ! homarr_write_v2_unit; then
+      log "ERROR Homarr: could not write ${HOMARR_SERVICE}"
+      homarr_rollback "$current" "$current_major" "$target_major"
+      return 1
+    fi
+  else
+    if ! homarr_write_v1_units; then
+      log "ERROR Homarr: could not write v1 units"
+      homarr_rollback "$current" "$current_major" "$target_major"
+      return 1
+    fi
+  fi
   chown -R "${MEDIASVC_USER}:${MEDIANAS_GROUP}" "$dir" "$data" 2>/dev/null || true
-  homarr_start
+  systemctl daemon-reload
+  homarr_start_gen "$target_major"
 
-  if homarr_health; then
+  if homarr_health "$target_major"; then
     log "Homarr updated to ${target} and healthy"
     return 0
   fi
 
   log "ERROR Homarr: health check failed - rolling back to ${current}"
-  homarr_stop
-  git_dir "$dir" checkout --quiet "$current" 2>/dev/null || true
-  restore_backup "$CURRENT_BACKUP" "$data" || true
-  homarr_build "$dir" || true
-  homarr_fix_units || true
-  chown -R "${MEDIASVC_USER}:${MEDIANAS_GROUP}" "$dir" "$data" 2>/dev/null || true
-  homarr_start
+  homarr_rollback "$current" "$current_major" "$target_major"
   return 1
 }
 
@@ -507,11 +808,26 @@ seerr_health() {
 }
 
 update_seerr() {
-  local dir="$SEERR_DIR" cur latest bp
+  local dir="$SEERR_DIR" cur latest bp snode spnpm exec_line
 
   [[ -d "$dir/.git" ]] || { log "SKIP Seerr: not installed at ${dir}"; return 0; }
+
+  # Seerr pins Node 22 + pnpm 10. Homarr uses system Node 24 + Bun; keep them
+  # isolated and refuse to touch Seerr if its embedded runtimes drifted.
   [[ -x "${NODE22_DIR}/bin/node" && -x "${PNPM10_DIR}/bin/pnpm" ]] \
     || { log "ERROR Seerr: embedded Node 22 / pnpm 10 not found (${NODE22_DIR}, ${PNPM10_DIR})"; return 1; }
+  snode="$("${NODE22_DIR}/bin/node" -v 2>/dev/null | sed 's/^v//')"
+  [[ "$(major_of "$snode")" == "$SEERR_NODE_MAJOR" ]] \
+    || { log "ERROR Seerr: ${NODE22_DIR}/bin/node is ${snode:-missing}, expected v${SEERR_NODE_MAJOR}.x"; return 1; }
+  spnpm="$(PATH="${PNPM10_DIR}/bin:${NODE22_DIR}/bin:$PATH" pnpm --version 2>/dev/null || true)"
+  [[ "$(major_of "$spnpm")" == "$SEERR_PNPM_MAJOR" ]] \
+    || { log "ERROR Seerr: ${PNPM10_DIR}/bin/pnpm is ${spnpm:-missing}, expected ${SEERR_PNPM_MAJOR}.x"; return 1; }
+
+  # The service must keep running on the embedded Node (never the system Node).
+  exec_line="$(systemctl show -p ExecStart --value seerr 2>/dev/null || true)"
+  if [[ -n "$exec_line" && "$exec_line" != *"${NODE22_DIR}/bin/node"* ]]; then
+    log "WARN Seerr: unit ExecStart does not use ${NODE22_DIR}/bin/node (leaving it unchanged)"
+  fi
 
   git_dir "$dir" fetch --quiet origin "$SEERR_BRANCH" || { log "ERROR Seerr: git fetch failed"; return 1; }
   cur="$(git_dir "$dir" rev-parse HEAD)"
@@ -609,9 +925,10 @@ Flags are combinable. With no flag, this help is shown and nothing is done.
 
   --servarr      Prowlarr, Radarr, Sonarr, Lidarr, Whisparr (backup + health + rollback)
   --qBittorrent  qBittorrent-nox via apt (backup + health + rollback)
-  --Homarr       Homarr via git tag + pnpm build (backup + health + rollback;
-                 prompts before a major version jump)
-  --Seerr        Seerr via git ${SEERR_BRANCH} + pnpm build (backup + health + rollback)
+  --Homarr       Homarr via git tag (v1 = pnpm, v2+ = Bun build; backup +
+                 health + rollback; prompts before a major version jump)
+  --Seerr        Seerr via git ${SEERR_BRANCH} + embedded Node 22/pnpm 10
+                 (backup + health + rollback)
   --Byparr       git pull ${BYPARR_DIR} + restart ${BYPARR_SERVICE} (no backup)
   -h, --help     Show this help
 
