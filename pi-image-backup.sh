@@ -29,7 +29,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 IMAGE_BACKUP="/usr/local/bin/RonR-RPi-image-utils/image-backup"
 NAS_MOUNT="/mnt/nas_Raspi-Backups"
 INCREMENTAL_IMG="${NAS_MOUNT}/$(hostname)_imagebackup.img"
-LOG="${NAS_MOUNT}/pi-image-backup.log"          #TODO Check if that works
+LOG="${NAS_MOUNT}/pi-image-backup.log"       
 LOCK="/var/lock/pi-image-backup.lock"
 
 # Free space added back AFTER shrinking - image-backup shrinks the fs to its minimum, then grows it again by this amount, so it stays in the final image.
@@ -59,14 +59,8 @@ log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
 do_full_backup() {
     # $1 = target image path, $2 = post-shrink reserve in MB (see settings above)
     local img="$1" reserve_mb="$2"
-    local used_mb init_mb
-    used_mb=$(df -m --output=used / | tail -1 | tr -d ' ')
-    # Temporary size for the initial copy only; shrunk away afterwards.
-    local buffer_mb=$((used_mb * 5 / 100))
-    [ "$buffer_mb" -lt 2048 ] && buffer_mb=2048
-    init_mb=$((used_mb + buffer_mb))
-    log "No existing image at ${img} - starting full backup (initial ${init_mb} MB, then shrink + ${reserve_mb} MB reserve)"
-    "$IMAGE_BACKUP" -i "${img},${init_mb},${reserve_mb}" >>"$LOG" 2>&1
+    log "Starting full backup to ${img} (image-backup computes the initial size, then shrink + ${reserve_mb} MB reserve)"
+    "$IMAGE_BACKUP" -i "${img},,${reserve_mb}" >>"$LOG" 2>&1
 }
 
 [ "$(id -u)" -eq 0 ] || { echo "Please run as root." >&2; exit 1; }
