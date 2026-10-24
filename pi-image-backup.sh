@@ -56,6 +56,60 @@ EOF
 
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
 
+log_start_context() {
+    local reserve_desc img_meta
+    if [ "$BACKUP_TYPE" = "full" ]; then
+        reserve_desc="${RESERVE_MB} MB"
+    else
+        reserve_desc="n/a"
+    fi
+    img_meta=$(stat -c '%y %s bytes' "$IMAGE_BACKUP" 2>/dev/null || true)
+    log "Backup type: ${BACKUP_TYPE}; image: ${CURRENT_IMG}; reserve: ${reserve_desc}"
+    log "Source root: $(df -h / | tail -1)"
+    log "Source inodes: $(df -i / | tail -1)"
+    log "NAS: $(df -h "$NAS_MOUNT" | tail -1)"
+    log "NAS inodes: $(df -i "$NAS_MOUNT" | tail -1)"
+    log "image-backup: ${img_meta}"
+    log "image-backup sizing: $(grep -m1 'INISIZE=' "$IMAGE_BACKUP" 2>/dev/null || true)"
+    log "Mounted filesystems under /:"
+    findmnt -R / -o TARGET,SOURCE,FSTYPE,SIZE,USED,AVAIL >>"$LOG" 2>&1 || true
+    log "Jellyfin backups and journal size:"
+    du -sh /var/backups/jellyfin-updater /var/log/journal >>"$LOG" 2>&1 || true
+}
+
+log_failure_context() {
+    log "Failure diagnostics:"
+    log "Source root after failure: $(df -h / | tail -1)"
+    log "Source inodes after failure: $(df -i / | tail -1)"
+    log "NAS after failure: $(df -h "$NAS_MOUNT" | tail -1)"
+    log "NAS inodes after failure: $(df -i "$NAS_MOUNT" | tail -1)"
+    if [ -n "${CURRENT_IMG}" ] && [ -e "${CURRENT_IMG}" ]; then
+        log "Image file after failure:"
+        ls -lh "$CURRENT_IMG" >>"$LOG" 2>&1
+        du -h "$CURRENT_IMG" >>"$LOG" 2>&1
+        du -h --apparent-size "$CURRENT_IMG" >>"$LOG" 2>&1
+    else
+        log "Image file does not exist after failure: ${CURRENT_IMG:-<unset>}"
+    fi
+    log "Top-level source usage (root filesystem):"
+    du -x -h -d1 / 2>/dev/null | sort -h | tail -n 20 >>"$LOG" 2>&1
+    log "Root filesystem allocated / apparent:"
+    du -x -s -h / >>"$LOG" 2>&1
+    du -x -s -h --apparent-size / >>"$LOG" 2>&1
+    log "Jellyfin backups and journal size after failure:"
+    du -sh /var/backups/jellyfin-updater /var/log/journal >>"$LOG" 2>&1 || true
+    log "Elapsed: $(( $(date +%s) - START_EPOCH ))s"
+}
+
+log_success_context() {
+    local allocated apparent
+    allocated=$(du -h "$CURRENT_IMG" 2>/dev/null | cut -f1)
+    apparent=$(du -h --apparent-size "$CURRENT_IMG" 2>/dev/null | cut -f1)
+    log "Image: ${CURRENT_IMG}; allocated: ${allocated}; apparent: ${apparent}"
+    log "NAS after success: $(df -h "$NAS_MOUNT" | tail -1)"
+    log "Elapsed: $(( $(date +%s) - START_EPOCH ))s"
+}
+
 do_full_backup() {
     # $1 = target image path, $2 = post-shrink reserve in MB (see settings above)
     local img="$1" reserve_mb="$2"
@@ -89,26 +143,40 @@ if ! mountpoint -q "$NAS_MOUNT"; then
     fi
 fi
 
-if [ "$MODE" = "incremental" ]; then
+BACKUP_TYPE=""
+CURRENT_IMG=""
+RESERVE_MB=""
 
-    #we're checking if a incremental backup file already exists.
+if [ "$MODE" = "incremental" ]; then
+    CURRENT_IMG="$INCREMENTAL_IMG"
     if [ -f "$INCREMENTAL_IMG" ]; then
-        # File exists -> incremental update only, no new reserve added.
-        log "Starting incremental backup: ${INCREMENTAL_IMG}"
-        "$IMAGE_BACKUP" "$INCREMENTAL_IMG" >>"$LOG" 2>&1
+        BACKUP_TYPE="incremental"
     else
-        # File missing -> first run, full backup with the 30 GB reserve.
-        do_full_backup "$INCREMENTAL_IMG" "$INCREMENTAL_RESERVE_MB"
+        BACKUP_TYPE="full"
+        RESERVE_MB="$INCREMENTAL_RESERVE_MB"
     fi
 else
-    DATED_IMG="${NAS_MOUNT}/backup-raspi-$(date '+%Y-%m-%d').img"
-    do_full_backup "$DATED_IMG" "$BACKUP_IMG_RESERVE_MB"
+    BACKUP_TYPE="full"
+    CURRENT_IMG="${NAS_MOUNT}/backup-raspi-$(date '+%Y-%m-%d').img"
+    RESERVE_MB="$BACKUP_IMG_RESERVE_MB"
+fi
+
+START_EPOCH=$(date +%s)
+log_start_context
+
+if [ "$BACKUP_TYPE" = "incremental" ]; then
+    log "Starting incremental backup: ${CURRENT_IMG}"
+    "$IMAGE_BACKUP" "$CURRENT_IMG" >>"$LOG" 2>&1
+else
+    do_full_backup "$CURRENT_IMG" "$RESERVE_MB"
 fi
 RC=$?
 
 if [ $RC -eq 0 ]; then
-    log "Backup completed successfully (mode: ${MODE})."
+    log "Backup completed successfully (backup type: ${BACKUP_TYPE}; mode: ${MODE})."
+    log_success_context
 else
-    log "ERROR: image-backup exited with code ${RC} (mode: ${MODE}; see ${LOG} for details)"
+    log_failure_context
+    log "ERROR: image-backup exited with code ${RC} (backup type: ${BACKUP_TYPE}; mode: ${MODE}; see ${LOG} for details)"
 fi
 exit $RC
