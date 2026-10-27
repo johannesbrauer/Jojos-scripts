@@ -36,6 +36,8 @@ LOCK="/var/lock/pi-image-backup.lock"
 INCREMENTAL_RESERVE_MB=30720    # 30 GB - persistent image, needs long-term growth room
 BACKUP_IMG_RESERVE_MB=2048      # 2 GB - one-off dated snapshot, no future growth needed, but we still want some space to work with it if we need it, so that we're still able to
                                 # install some needed packages for resizing etc.
+SNAP_EXCLUDE="--exclude=/snap/*"
+SNAP_INCREMENTAL_OPTS="--exclude=/snap/*,--delete-excluded,--delete-before"
 # -------------------------------------------
 
 usage() {
@@ -56,6 +58,25 @@ EOF
 
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
 
+cleanup_image_mount() {
+    local mnt="/tmp/img-backup-mnt" src loop
+    local -a loops=()
+    mountpoint -q "$mnt" || return 0
+    log "Cleaning stale image mount at ${mnt}"
+    findmnt -R "$mnt" -o TARGET,SOURCE,FSTYPE >>"$LOG" 2>&1 || true
+    while read -r src; do
+        case "$src" in
+            /dev/loop*p[0-9]*) loops+=("${src%p[0-9]*}") ;;
+            /dev/loop*) loops+=("$src") ;;
+        esac
+    done < <(findmnt -n -R "$mnt" -o SOURCE)
+    umount -R "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
+    for loop in "${loops[@]}"; do
+        losetup -d "$loop" 2>/dev/null || true
+    done
+    log "NAS after stale-mount cleanup: $(df -h "$NAS_MOUNT" | tail -1)"
+}
+
 log_start_context() {
     local reserve_desc img_meta
     if [ "$BACKUP_TYPE" = "full" ]; then
@@ -73,6 +94,10 @@ log_start_context() {
     log "image-backup sizing: $(grep -m1 'INISIZE=' "$IMAGE_BACKUP" 2>/dev/null || true)"
     log "Mounted filesystems under /:"
     findmnt -R / -o TARGET,SOURCE,FSTYPE,SIZE,USED,AVAIL >>"$LOG" 2>&1 || true
+    log "Snap mount view excluded: /snap/* (actual snap packages remain in /var/lib/snapd/snaps)"
+    log "Snap mount view size (allocated / apparent):"
+    du -sh /snap >>"$LOG" 2>&1 || true
+    du -sh --apparent-size /snap >>"$LOG" 2>&1 || true
     log "Jellyfin backups and journal size:"
     du -sh /var/backups/jellyfin-updater /var/log/journal >>"$LOG" 2>&1 || true
 }
@@ -113,8 +138,8 @@ log_success_context() {
 do_full_backup() {
     # $1 = target image path, $2 = post-shrink reserve in MB (see settings above)
     local img="$1" reserve_mb="$2"
-    log "Starting full backup to ${img} (image-backup computes the initial size, then shrink + ${reserve_mb} MB reserve)"
-    "$IMAGE_BACKUP" -i "${img},,${reserve_mb}" >>"$LOG" 2>&1
+    log "Starting full backup to ${img} (image-backup computes the initial size, excludes /snap/*, then shrink + ${reserve_mb} MB reserve)"
+    "$IMAGE_BACKUP" -i "${img},,${reserve_mb}" -o "$SNAP_EXCLUDE" >>"$LOG" 2>&1
 }
 
 [ "$(id -u)" -eq 0 ] || { echo "Please run as root." >&2; exit 1; }
@@ -143,6 +168,12 @@ if ! mountpoint -q "$NAS_MOUNT"; then
     fi
 fi
 
+if [ -n "$(pidof -x image-backup 2>/dev/null || true)" ]; then
+    log "ERROR: image-backup is already running - aborting."
+    exit 1
+fi
+cleanup_image_mount
+
 BACKUP_TYPE=""
 CURRENT_IMG=""
 RESERVE_MB=""
@@ -165,12 +196,13 @@ START_EPOCH=$(date +%s)
 log_start_context
 
 if [ "$BACKUP_TYPE" = "incremental" ]; then
-    log "Starting incremental backup: ${CURRENT_IMG}"
-    "$IMAGE_BACKUP" "$CURRENT_IMG" >>"$LOG" 2>&1
+    log "Starting incremental backup: ${CURRENT_IMG} (excluding /snap/*; freeing excluded data first)"
+    "$IMAGE_BACKUP" "$CURRENT_IMG" -o "$SNAP_INCREMENTAL_OPTS" >>"$LOG" 2>&1
 else
     do_full_backup "$CURRENT_IMG" "$RESERVE_MB"
 fi
 RC=$?
+cleanup_image_mount
 
 if [ $RC -eq 0 ]; then
     log "Backup completed successfully (backup type: ${BACKUP_TYPE}; mode: ${MODE})."
