@@ -45,7 +45,8 @@ QBIT_CONFIG_DIR="/home/qbtuser/.config/qBittorrent"
 
 # Homarr (source build, like the installer).
 # v1 = pnpm + the three units below; v2+ = Bun + a single unit. Bun is installed
-# system-wide on demand (the installer only provisioned the system's Node 24).
+# system-wide on demand. The exact Node/Bun minimums are read from the target
+# tag's package.json (engines); these are only fallbacks.
 HOMARR_DIR="/opt/homarr"
 HOMARR_DATA_DIR="/opt/homarr-data"
 HOMARR_HEALTH_URL="http://127.0.0.1:3000/api/health/live"
@@ -53,9 +54,8 @@ HOMARR_UNITS=(homarr-nextjs homarr-websocket homarr-tasks)
 HOMARR_SERVICE="homarr.service"
 SYSTEMD_UNIT_DIR="/etc/systemd/system"
 BUN_BIN="/usr/local/bin/bun"
-BUN_VERSION="1.4.2"
-HOMARR_MIN_NODE="24.18.0"
-HOMARR_NODE_MAJOR="24"
+BUN_VERSION="1.4.4"
+HOMARR_MIN_NODE="24.22.1"
 
 # Seerr (source build with the private Node 22 + pnpm 10 the installer embedded).
 # Keep these majors unchanged: the Homarr v2 path must never disturb them.
@@ -91,6 +91,8 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"; }
 
 WORK_DIR=""
 CURRENT_BACKUP=""
+HOMARR_REQ_NODE="$HOMARR_MIN_NODE"
+HOMARR_REQ_BUN="$BUN_VERSION"
 cleanup() { if [[ -n "$WORK_DIR" ]]; then rm -rf "$WORK_DIR"; fi; return 0; }
 trap cleanup EXIT
 
@@ -113,7 +115,7 @@ git_dir() { local d="$1"; shift; git -c "safe.directory=$d" -C "$d" "$@"; }
 
 ensure_deps() {
   local missing=() c
-  for c in curl git jq tar; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
+  for c in curl git jq tar openssl; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
   if [[ ${#missing[@]} -gt 0 ]]; then
     log "Installing missing packages: ${missing[*]}"
     DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
@@ -397,47 +399,80 @@ version_ge() {
   return 0
 }
 
-# Install the pinned Bun system-wide ($HOME/.bun is useless to systemd).
+# Checkout <tag>, discarding generated tracked files (e.g. the docs sitemap a
+# previous build rewrote). User data lives in $HOMARR_DATA_DIR and .env only.
+homarr_checkout() {
+  local tag="$1"
+  if ! git_dir "$HOMARR_DIR" diff --quiet --ignore-submodules -- 2>/dev/null \
+     || ! git_dir "$HOMARR_DIR" diff --cached --quiet --ignore-submodules -- 2>/dev/null; then
+    log "WARN Homarr: discarding local modifications in ${HOMARR_DIR} (generated build files)"
+  fi
+  git_dir "$HOMARR_DIR" checkout --force --quiet "$tag"
+}
+
+# Read engines.node / engines.bun from <tag>:package.json (no checkout needed).
+read_homarr_requirements() {
+  local tag="$1" pkg node_req bun_req
+  HOMARR_REQ_NODE="$HOMARR_MIN_NODE"
+  HOMARR_REQ_BUN="$BUN_VERSION"
+  pkg="$(git_dir "$HOMARR_DIR" show "${tag}:package.json" 2>/dev/null || true)"
+  [[ -n "$pkg" ]] || { log "WARN Homarr: could not read package.json at ${tag}; using fallback minimums"; return 0; }
+  node_req="$(printf '%s\n' "$pkg" | sed -n 's/.*"node"[[:space:]]*:[[:space:]]*">=[[:space:]]*\([0-9][0-9.]*\)".*/\1/p' | head -n1)"
+  bun_req="$(printf '%s\n' "$pkg" | sed -n 's/.*"bun"[[:space:]]*:[[:space:]]*">=[[:space:]]*\([0-9][0-9.]*\)".*/\1/p' | head -n1)"
+  if [[ -z "$bun_req" ]]; then
+    bun_req="$(printf '%s\n' "$pkg" | sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"bun@\([0-9][0-9.]*\)".*/\1/p' | head -n1)"
+  fi
+  if [[ -n "$node_req" ]]; then HOMARR_REQ_NODE="$node_req"; fi
+  if [[ -n "$bun_req" ]]; then HOMARR_REQ_BUN="$bun_req"; fi
+  return 0
+}
+
+# Install the required Bun minimum system-wide ($HOME/.bun is useless to systemd).
 ensure_bun() {
-  local have
+  local min="${1:-$BUN_VERSION}" have
   if [[ -x "$BUN_BIN" ]]; then
     have="$("$BUN_BIN" --version 2>/dev/null || true)"
-    if version_ge "$have" "$BUN_VERSION"; then
-      log "Homarr: Bun ${have} already installed"
+    if version_ge "$have" "$min"; then
+      log "Homarr: Bun ${have} OK (need >= ${min})"
       return 0
     fi
+    log "Homarr: Bun ${have:-unknown} is older than the required ${min}"
   fi
-  log "Homarr: installing Bun ${BUN_VERSION} into /usr/local ..."
+  log "Homarr: installing Bun ${min} into /usr/local ..."
   command -v unzip >/dev/null 2>&1 \
     || DEBIAN_FRONTEND=noninteractive apt-get install -y unzip >>"$LOG_FILE" 2>&1 || true
   if ! curl -fsSL https://bun.sh/install 2>>"$LOG_FILE" \
-       | BUN_INSTALL=/usr/local bash -s "bun-v${BUN_VERSION}" >>"$LOG_FILE" 2>&1; then
+       | BUN_INSTALL=/usr/local bash -s "bun-v${min}" >>"$LOG_FILE" 2>&1; then
     log "ERROR Homarr: Bun install script failed"
     return 1
   fi
-  [[ -x "$BUN_BIN" ]] || { log "ERROR Homarr: ${BUN_BIN} missing after install"; return 1; }
-  log "Homarr: Bun $("$BUN_BIN" --version) installed"
+  have="$("$BUN_BIN" --version 2>/dev/null || true)"
+  version_ge "$have" "$min" \
+    || { log "ERROR Homarr: Bun ${have:-missing} is still < ${min} after install"; return 1; }
+  log "Homarr: Bun ${have} installed"
 }
 
-# Homarr v2 needs Node >= 24.18 system-wide (used by `bun run build/start`).
-# Seerr keeps its own Node 22 + pnpm 10; never touch those - only verify.
-ensure_node_24() {
-  local v sv pv
+# Homarr v2 needs a recent Node (>= the target's engines.node) system-wide for
+# `bun run`. Seerr keeps its own Node 22 + pnpm 10; never touch those - verify.
+ensure_node_min() {
+  local min="${1:-$HOMARR_MIN_NODE}" major v sv pv
+  major="$(major_of "$min")"
   v="$(node -v 2>/dev/null || true)"; v="${v#v}"
-  if [[ -n "$v" ]] && version_ge "$v" "$HOMARR_MIN_NODE"; then
-    log "Homarr: system Node ${v} OK"
+  if [[ -n "$v" ]] && version_ge "$v" "$min"; then
+    log "Homarr: system Node ${v} OK (need >= ${min})"
   else
-    log "Homarr: installing Node ${HOMARR_NODE_MAJOR} (need >= ${HOMARR_MIN_NODE}) ..."
-    if ! curl -fsSL "https://deb.nodesource.com/setup_${HOMARR_NODE_MAJOR}.x" 2>>"$LOG_FILE" \
+    log "Homarr: installing Node ${major} (need >= ${min}) ..."
+    if ! curl -fsSL "https://deb.nodesource.com/setup_${major}.x" 2>>"$LOG_FILE" \
          | bash - >>"$LOG_FILE" 2>&1; then
       log "ERROR Homarr: nodesource setup failed"
       return 1
     fi
+    apt-get update -qq >>"$LOG_FILE" 2>&1 || true
     DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs >>"$LOG_FILE" 2>&1 \
       || { log "ERROR Homarr: Node install failed"; return 1; }
     v="$(node -v 2>/dev/null || true)"; v="${v#v}"
-    version_ge "$v" "$HOMARR_MIN_NODE" \
-      || { log "ERROR Homarr: Node ${v:-missing} is still < ${HOMARR_MIN_NODE}"; return 1; }
+    version_ge "$v" "$min" \
+      || { log "ERROR Homarr: Node ${v:-missing} is still < ${min} (NodeSource may not offer it yet); aborting before stopping Homarr"; return 1; }
     # A Node reinstall can drop the global pnpm the v1 rollback path needs.
     command -v pnpm >/dev/null 2>&1 \
       || npm install -g pnpm@11.15.1 --silent >>"$LOG_FILE" 2>&1 || true
@@ -483,25 +518,35 @@ homarr_ensure_env() {
 homarr_build_v1() {
   local dir="$1"
   (
-    cd "$dir"
+    cd "$dir" || exit 1
+    unset NODE_ENV
     pnpm install --frozen-lockfile && pnpm build && pnpm db:migration:sqlite:run
   ) >>"$LOG_FILE" 2>&1
 }
 
-# v2: Bun + Turbo. The repo's `build` script only assembles a standalone
-# artifact, so fall back to the nextjs compiled build if no .next is produced.
+# v2: Bun + Turbo. Use the same filtered build as the official Dockerfile so
+# only Next.js (and its deps) is compiled - building apps/docs would rewrite
+# tracked files (homarr-docs-sitemap.ts) and slow the update down. Fall back to
+# a direct next build if Turbo fails but still require a real .next/BUILD_ID.
 homarr_build_v2() {
   local dir="$1"
   (
     export PATH="/usr/local/bin:${PATH}"
+    unset NODE_ENV
+    export CI=true SKIP_ENV_VALIDATION=true DISABLE_REDIS_LOGS=true
     local built=0
     cd "$dir" || exit 1
-    "$BUN_BIN" install --frozen-lockfile || exit 1
+    "$BUN_BIN" install --frozen-lockfile --concurrent-scripts=1 || exit 1
     "$BUN_BIN" run db:migration:sqlite:run || exit 1
-    if "$BUN_BIN" run build; then built=1; fi
+    if "$BUN_BIN" run turbo run build --filter=@homarr/nextjs...; then built=1; fi
     if [[ "$built" != 1 || ! -f apps/nextjs/.next/BUILD_ID ]]; then
-      echo "WARN Homarr: 'bun run build' failed/incomplete; trying apps/nextjs build:compiled" >&2
-      ( cd apps/nextjs && "$BUN_BIN" run build:compiled ) || exit 1
+      echo "WARN Homarr: turbo build failed/incomplete; rebuilding apps/nextjs directly" >&2
+      rm -rf apps/nextjs/.next
+      ( cd apps/nextjs \
+          && HOMARR_VERSION="$(node -p "require('../../package.json').version")" \
+             "$BUN_BIN" run with-env node ../../node_modules/next/dist/bin/next build ) || exit 1
+      ( cd apps/nextjs && node scripts/prepare-tabler-icons.mjs ) \
+        || echo "WARN Homarr: could not prepare tabler icons (icons may 404)" >&2
     fi
     [[ -f apps/nextjs/.next/BUILD_ID ]] || exit 1
   ) >>"$LOG_FILE" 2>&1
@@ -532,7 +577,7 @@ homarr_write_v1_units() {
     return 1
   fi
 
-  cat > "${SYSTEMD_UNIT_DIR}/homarr-nextjs.service" <<EOF
+  cat > "${SYSTEMD_UNIT_DIR}/homarr-nextjs.service" <<EOF || return 1
 [Unit]
 Description=Homarr nextjs
 After=network.target
@@ -552,7 +597,7 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-  cat > "${SYSTEMD_UNIT_DIR}/homarr-websocket.service" <<EOF
+  cat > "${SYSTEMD_UNIT_DIR}/homarr-websocket.service" <<EOF || return 1
 [Unit]
 Description=Homarr websocket
 After=network.target
@@ -572,7 +617,7 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-  cat > "${SYSTEMD_UNIT_DIR}/homarr-tasks.service" <<EOF
+  cat > "${SYSTEMD_UNIT_DIR}/homarr-tasks.service" <<EOF || return 1
 [Unit]
 Description=Homarr tasks
 After=network.target
@@ -602,7 +647,7 @@ EOF
 # Write the single v2 unit and remove the three v1 units.
 homarr_write_v2_unit() {
   local u
-  cat > "${SYSTEMD_UNIT_DIR}/${HOMARR_SERVICE}" <<EOF
+  cat > "${SYSTEMD_UNIT_DIR}/${HOMARR_SERVICE}" <<EOF || return 1
 [Unit]
 Description=Homarr
 After=network.target redis-server.service
@@ -669,8 +714,10 @@ homarr_start_gen() {
 }
 
 # Roll back to <tag> using <gen>'s toolchain/units, restoring the DB backup.
+# Best effort: always attempt to restore the tree, DB, build, units and start.
 homarr_rollback() {
   local current="$1" gen="$2" failed_gen="$3"
+  log "==> Homarr: rolling back to ${current} (v${gen} toolchain)"
   homarr_stop_gen 1
   homarr_stop_gen 2
   if [[ "$failed_gen" != "$gen" ]]; then
@@ -678,18 +725,28 @@ homarr_rollback() {
     rm -rf "$HOMARR_DIR/apps/nextjs/.next" "$HOMARR_DIR/apps/nextjs/.output" "$HOMARR_DIR/.turbo"
     find "$HOMARR_DIR" -type d -name node_modules -prune -exec rm -rf {} + 2>/dev/null || true
   fi
-  git_dir "$HOMARR_DIR" checkout --quiet "$current" 2>/dev/null || true
-  restore_backup "$CURRENT_BACKUP" "$HOMARR_DATA_DIR" || true
-  homarr_build "$HOMARR_DIR" "$gen" || log "WARN Homarr: rollback rebuild failed"
+  if ! homarr_checkout "$current"; then
+    log "ERROR Homarr: could not restore ${current} in the working tree"
+  fi
+  if ! restore_backup "$CURRENT_BACKUP" "$HOMARR_DATA_DIR"; then
+    log "ERROR Homarr: DB restore failed - the database may still be migrated"
+  fi
+  if ! homarr_build "$HOMARR_DIR" "$gen"; then
+    log "ERROR Homarr: rollback rebuild failed"
+  fi
   if [[ "$gen" -ge 2 ]]; then
-    homarr_write_v2_unit || log "WARN Homarr: could not restore ${HOMARR_SERVICE}"
+    homarr_write_v2_unit || log "ERROR Homarr: could not restore ${HOMARR_SERVICE}"
   else
-    homarr_write_v1_units || log "WARN Homarr: could not restore v1 units"
+    homarr_write_v1_units || log "ERROR Homarr: could not restore v1 units"
   fi
   chown -R "${MEDIASVC_USER}:${MEDIANAS_GROUP}" "$HOMARR_DIR" "$HOMARR_DATA_DIR" 2>/dev/null || true
-  systemctl daemon-reload
+  systemctl daemon-reload || log "WARN Homarr: daemon-reload failed during rollback"
   homarr_start_gen "$gen"
-  homarr_health "$gen" || log "WARN Homarr: still unhealthy after rollback"
+  if homarr_health "$gen"; then
+    log "Homarr rolled back to ${current} and healthy"
+  else
+    log "ERROR Homarr: rollback to ${current} did not become healthy"
+  fi
   return 1
 }
 
@@ -720,14 +777,21 @@ update_homarr() {
   target_major="$(major_of "$target")"
   [[ "$target" == "$current" ]] && { log "Homarr already up to date (${current})"; return 0; }
 
+  # The target may have raised its Node/Bun minimums (v2.10.1: Node 24.22.1,
+  # Bun 1.4.4). Read them from the tag itself so future releases keep working.
+  if [[ "$target_major" -ge 2 ]]; then
+    read_homarr_requirements "$target"
+    log "Homarr: target ${target} requires Node >= ${HOMARR_REQ_NODE}, Bun >= ${HOMARR_REQ_BUN}"
+  fi
+
   log "==> Homarr: ${current} -> ${target} (v${current_major} -> v${target_major} toolchain)"
 
   # Preflight BEFORE stopping anything, so a missing tool leaves Homarr running.
   if [[ "$target_major" -ge 2 ]]; then
-    ensure_node_24 || { log "ERROR Homarr: Node preflight failed"; return 1; }
+    ensure_node_min "$HOMARR_REQ_NODE" || { log "ERROR Homarr: Node preflight failed"; return 1; }
     ensure_redis   || { log "ERROR Homarr: Redis preflight failed"; return 1; }
     homarr_ensure_env || { log "ERROR Homarr: .env preflight failed"; return 1; }
-    ensure_bun     || { log "ERROR Homarr: Bun preflight failed"; return 1; }
+    ensure_bun "$HOMARR_REQ_BUN" || { log "ERROR Homarr: Bun preflight failed"; return 1; }
   else
     command -v pnpm >/dev/null 2>&1 || { log "ERROR Homarr: pnpm not found (v1 build)"; return 1; }
   fi
@@ -736,9 +800,9 @@ update_homarr() {
   backup_now "Homarr" "${bp[@]}" || { log "ERROR Homarr: backup failed"; return 1; }
 
   homarr_stop_gen "$current_major"
-  if ! git_dir "$dir" checkout --quiet "$target"; then
-    log "ERROR Homarr: checkout ${target} failed"
-    homarr_start_gen "$current_major"
+  if ! homarr_checkout "$target"; then
+    log "ERROR Homarr: checkout ${target} failed - rolling back"
+    homarr_rollback "$current" "$current_major" "$target_major"
     return 1
   fi
 
@@ -770,7 +834,11 @@ update_homarr() {
     fi
   fi
   chown -R "${MEDIASVC_USER}:${MEDIANAS_GROUP}" "$dir" "$data" 2>/dev/null || true
-  systemctl daemon-reload
+  if ! systemctl daemon-reload; then
+    log "ERROR Homarr: systemd daemon-reload failed - rolling back"
+    homarr_rollback "$current" "$current_major" "$target_major"
+    return 1
+  fi
   homarr_start_gen "$target_major"
 
   if homarr_health "$target_major"; then
