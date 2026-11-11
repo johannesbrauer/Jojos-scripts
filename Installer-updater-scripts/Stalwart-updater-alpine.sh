@@ -13,15 +13,17 @@
 #     includes early failures like "GitHub API unreachable/changed", so the
 #     server never silently stops receiving updates for months unnoticed.
 #   - A new MAJOR or MINOR version is never auto-applied; a mail is sent instead,
-#     asking for a manual upgrade after reading the changelog.
+#     asking for a manual upgrade after reading the changelog. Passing
+#     --upgrade-anyway allows a confirmed manual override of this gate.
 #   - Normal patch updates: one mail when an update is about to be
 #     attempted, one on success, one on failure (with rollback + log attached).
 #
 # Usage:
-#   stalwart-updater-alpine.sh                 run an update check/apply now
-#   stalwart-updater-alpine.sh --install-cron  register a daily 00:00 cron job
-#   stalwart-updater-alpine.sh --check-only    only report whether an update exists (no mail)
-#   stalwart-updater-alpine.sh --test-mail     send a test e-mail and exit
+#   stalwart-updater-alpine.sh                    run an update check/apply now
+#   stalwart-updater-alpine.sh --install-cron     register a daily 00:00 cron job
+#   stalwart-updater-alpine.sh --check-only       only report whether an update exists (no mail)
+#   stalwart-updater-alpine.sh --upgrade-anyway   allow a confirmed major/minor upgrade
+#   stalwart-updater-alpine.sh --test-mail        send a test e-mail and exit
 # ==============================================================================
 
 set -eu
@@ -208,6 +210,11 @@ fi
 mkdir "$LOCK_DIR" 2>/dev/null || die "Another instance appears to be running (lock: $LOCK_DIR)."
 trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
 
+UPGRADE_ANYWAY=0
+if [ "${1:-}" = "--upgrade-anyway" ]; then
+    UPGRADE_ANYWAY=1
+fi
+
 log "=== Stalwart update check started ==="
 [ -x "$BIN" ] || die "Stalwart binary not found at $BIN. Is it installed via the installer script?"
 
@@ -254,9 +261,28 @@ if [ "${1:-}" = "--check-only" ]; then
 fi
 
 # --- Major or minor version bump: never auto-update, just alert --------------
+# (unless the operator explicitly passed --upgrade-anyway and confirmed)
 if [ "$IS_FEATURE_BUMP" -eq 1 ]; then
-    log "New major/minor version detected ($CURRENT_VERSION -> $LATEST_VERSION). Skipping auto-update."
-    send_mail "Stalwart: NEW MAJOR/MINOR VERSION available (${CURRENT_VERSION} -> ${LATEST_VERSION})" \
+    if [ "$UPGRADE_ANYWAY" -eq 1 ]; then
+        if [ ! -t 0 ]; then
+            log "ERROR: --upgrade-anyway requires an interactive terminal for confirmation. Aborting."
+            exit 1
+        fi
+        printf 'Are you sure you want to apply a major / minor version update automatically, this could break the setup, make sure you have everything backed up. Continue anyway? N/y '
+        answer=""
+        read -r answer || answer=""
+        case "$answer" in
+            y|Y)
+                log "Major/minor upgrade (${CURRENT_VERSION} -> ${LATEST_VERSION}) confirmed by user."
+                # Continue with the normal update flow below.
+                ;;
+
+            *)   log "Major/minor upgrade aborted by user (no changes made)."; exit 0 ;;
+        esac
+    #if the flag is not passed we're proceeding with the nomal mail - do nothing behavior
+    else
+        log "New major/minor version detected ($CURRENT_VERSION -> $LATEST_VERSION). Skipping auto-update."
+        send_mail "Stalwart: NEW MAJOR/MINOR VERSION available (${CURRENT_VERSION} -> ${LATEST_VERSION})" \
 "Host: ${HOST_LABEL}
 
 New major/minor version available: Stalwart ${LATEST_VERSION} (currently installed: ${CURRENT_VERSION}).
@@ -270,7 +296,8 @@ changelog and upgrade references, then upgrade manually soon:
 
 Only pure patch-level updates (same major.minor, higher patch number) are
 applied automatically by this script."
-    exit 0
+        exit 0
+    fi
 fi
 
 send_mail "Stalwart: trying to auto-update ${CURRENT_VERSION} -> ${LATEST_VERSION}" \
